@@ -2,11 +2,12 @@ name: Omner native OIDC image
 
 on:
   push:
-    branches: [codex/hermex-native-oidc-v2026.8.19]
+    branches: [codex/hermes-hindsight-warning-v2026.8.19]
   workflow_dispatch:
 
 permissions:
   contents: read
+  id-token: write
   packages: write
 
 concurrency:
@@ -36,9 +37,46 @@ jobs:
           file: docker/omner-native-oidc.Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/luken/hermes-agent:omner-native-oidc-v2026.8.19
+          tags: ghcr.io/luken/hermes-agent:omner-native-oidc-hindsight-v2026.8.19-r1
+          sbom: true
+          provenance: mode=max
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
 
-      - name: Record immutable digest
-        run: echo "ghcr.io/luken/hermes-agent@${{ steps.image.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Scan immutable image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/luken/hermes-agent@${{ steps.image.outputs.digest }}
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: json
+          output: trivy-results.json
+
+      - name: Retain vulnerability evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-hindsight-trivy-${{ github.sha }}
+          path: trivy-results.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+
+      - name: Sign immutable image with GitHub OIDC
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/luken/hermes-agent@${DIGEST}"
+
+      - name: Verify signature identity and record immutable digest
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          cosign verify \
+            --certificate-identity 'https://github.com/luken/hermes-agent/.github/workflows/omner-native-oidc-image.yml@refs/heads/codex/hermes-hindsight-warning-v2026.8.19' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "ghcr.io/luken/hermes-agent@${DIGEST}"
+          echo "ghcr.io/luken/hermes-agent@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
