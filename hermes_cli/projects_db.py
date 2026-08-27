@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS projects (
     color         TEXT,
     board_slug    TEXT,
     primary_path  TEXT,
+    factory_slug  TEXT UNIQUE,
+    matrix_room_id TEXT UNIQUE,
+    factory_lifecycle TEXT,
     created_at    INTEGER NOT NULL,
     archived      INTEGER NOT NULL DEFAULT 0
 );
@@ -200,7 +203,10 @@ def connect_closing(db_path: Optional[Path] = None):
 
 # TEXT columns added to `projects` after v1; re-applied idempotently on every
 # open so a legacy DB upgrades in place.
-_OPTIONAL_PROJECT_COLUMNS = ("board_slug", "primary_path", "icon", "color")
+_OPTIONAL_PROJECT_COLUMNS = (
+    "board_slug", "primary_path", "icon", "color", "factory_slug",
+    "matrix_room_id", "factory_lifecycle",
+)
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
@@ -209,6 +215,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     for col in _OPTIONAL_PROJECT_COLUMNS:
         if col not in cols:
             _add_column_if_missing(conn, "projects", col, f"{col} TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_factory_slug "
+        "ON projects(factory_slug) WHERE factory_slug IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_matrix_room_id "
+        "ON projects(matrix_room_id) WHERE matrix_room_id IS NOT NULL"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +257,9 @@ class Project:
     color: Optional[str] = None
     board_slug: Optional[str] = None
     primary_path: Optional[str] = None
+    factory_slug: Optional[str] = None
+    matrix_room_id: Optional[str] = None
+    factory_lifecycle: Optional[str] = None
     archived: bool = False
     folders: List[ProjectFolder] = field(default_factory=list)
 
@@ -256,6 +273,9 @@ class Project:
             "color": self.color,
             "board_slug": self.board_slug,
             "primary_path": self.primary_path,
+            "factory_slug": self.factory_slug,
+            "matrix_room_id": self.matrix_room_id,
+            "factory_lifecycle": self.factory_lifecycle,
             "archived": bool(self.archived),
             "created_at": self.created_at,
             "folders": [f.to_dict() for f in self.folders],
@@ -274,6 +294,9 @@ def _project_from_row(row: sqlite3.Row) -> Project:
         color=row["color"] if "color" in keys else None,
         board_slug=row["board_slug"] if "board_slug" in keys else None,
         primary_path=row["primary_path"] if "primary_path" in keys else None,
+        factory_slug=row["factory_slug"] if "factory_slug" in keys else None,
+        matrix_room_id=row["matrix_room_id"] if "matrix_room_id" in keys else None,
+        factory_lifecycle=row["factory_lifecycle"] if "factory_lifecycle" in keys else None,
         archived=bool(row["archived"]) if "archived" in keys else False,
     )
 
@@ -614,6 +637,113 @@ def archive_project(conn: sqlite3.Connection, project_id: str) -> bool:
             "UPDATE projects SET archived = 1 WHERE id = ?", (project_id,)
         )
     return cur.rowcount > 0
+
+
+def _factory_display_name(slug: str) -> str:
+    """Human-readable name for a factory-owned slug without changing its ID."""
+    return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-"))
+
+
+def sync_factory_project(
+    conn: sqlite3.Connection,
+    *,
+    slug: str,
+    root: str,
+    matrix_room_id: str,
+) -> Project:
+    """Idempotently create or repair the factory-managed project for ``slug``.
+
+    Factory ownership is deliberately explicit.  A factory sync never adopts an
+    ordinary project or overwrites a different factory project's room/path;
+    callers must resolve that conflict instead of making the dispatcher catalog
+    ambiguous.
+    """
+    factory_slug = normalize_slug(slug)
+    if not factory_slug:
+        raise ValueError("factory slug must not be empty")
+    root = _normalize_path(root)
+    if not root:
+        raise ValueError("factory root must not be empty")
+    room = str(matrix_room_id or "").strip()
+    if not room.startswith("!") or ":" not in room:
+        raise ValueError("matrix room id must be a Matrix room ID")
+
+    existing = get_project(conn, factory_slug)
+    by_factory = conn.execute(
+        "SELECT * FROM projects WHERE factory_slug = ?", (factory_slug,)
+    ).fetchone()
+    by_room = conn.execute(
+        "SELECT * FROM projects WHERE matrix_room_id = ?", (room,)
+    ).fetchone()
+    if by_room is not None and by_room["factory_slug"] != factory_slug:
+        raise ValueError("Matrix room is already linked to another factory project")
+    if by_factory is not None:
+        existing = _attach_folders(conn, _project_from_row(by_factory))
+    if existing is not None and existing.factory_slug not in (None, factory_slug):
+        raise ValueError("factory slug is already owned by another project")
+    if existing is not None and existing.factory_slug is None:
+        raise ValueError(
+            f"ordinary project '{existing.slug}' conflicts with factory slug; "
+            "rename or remove it before factory sync"
+        )
+    path_owner = find_by_primary_path(conn, root, include_archived=True)
+    if path_owner is not None and path_owner.id != (existing.id if existing else None):
+        raise ValueError(
+            f"factory root is already owned by project '{path_owner.slug}'; "
+            "factory projects cannot share a primary path"
+        )
+
+    subfolders = [root, *[os.path.join(root, name) for name in ("source", "datasets", "shared", "deploy")]]
+    if existing is None:
+        pid = create_project(
+            conn, name=_factory_display_name(factory_slug), slug=factory_slug,
+            folders=subfolders, primary_path=root, allow_duplicate_path=True,
+        )
+    else:
+        pid = existing.id
+    now = _now()
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE projects SET name = ?, primary_path = ?, factory_slug = ?, "
+            "matrix_room_id = ?, factory_lifecycle = 'active', archived = 0 WHERE id = ?",
+            (_factory_display_name(factory_slug), root, factory_slug, room, pid),
+        )
+    for path in subfolders:
+        add_folder(conn, pid, path, label=os.path.basename(path) or "root", is_primary=(path == root))
+    proj = get_project(conn, pid)
+    if proj is None:
+        raise ValueError("factory project vanished during sync")
+    return proj
+
+
+def archive_factory_project(conn: sqlite3.Connection, slug: str) -> Project:
+    """Archive only a factory-owned project, retaining its durable link data."""
+    factory_slug = normalize_slug(slug)
+    row = conn.execute(
+        "SELECT * FROM projects WHERE factory_slug = ?", (factory_slug,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no factory project for slug '{factory_slug}'")
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE projects SET archived = 1, factory_lifecycle = 'archived' WHERE id = ?",
+            (row["id"],),
+        )
+    proj = get_project(conn, row["id"])
+    if proj is None:
+        raise ValueError("factory project vanished during archive")
+    return proj
+
+
+def get_factory_project(conn: sqlite3.Connection, slug: str) -> Optional[Project]:
+    """Return the factory-owned project for ``slug`` without adopting others."""
+    factory_slug = normalize_slug(slug)
+    if not factory_slug:
+        return None
+    row = conn.execute(
+        "SELECT * FROM projects WHERE factory_slug = ?", (factory_slug,)
+    ).fetchone()
+    return _attach_folders(conn, _project_from_row(row)) if row is not None else None
 
 
 def restore_project(conn: sqlite3.Connection, project_id: str) -> bool:

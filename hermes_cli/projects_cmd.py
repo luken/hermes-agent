@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import json
 import sys
 
 from hermes_cli import projects_db as pdb
@@ -101,6 +102,20 @@ def build_parser(
         "board", nargs="?", default="", help="Board slug (omit to unbind)"
     )
 
+    p_factory_sync = sub.add_parser("factory-sync", help="Idempotently sync a factory-owned project")
+    p_factory_sync.add_argument("slug")
+    p_factory_sync.add_argument("--root", required=True)
+    p_factory_sync.add_argument("--matrix-room-id", required=True)
+    p_factory_sync.add_argument("--json", action="store_true")
+
+    p_factory_archive = sub.add_parser("factory-archive", help="Archive a factory-owned project")
+    p_factory_archive.add_argument("slug")
+    p_factory_archive.add_argument("--json", action="store_true")
+
+    p_factory_show = sub.add_parser("factory-show", help="Show a factory-owned project")
+    p_factory_show.add_argument("slug")
+    p_factory_show.add_argument("--json", action="store_true")
+
     parser.set_defaults(_project_parser=parser)
     return parser
 
@@ -133,6 +148,9 @@ def projects_command(args: argparse.Namespace) -> int:
         "archive": _cmd_archive,
         "restore": _cmd_restore,
         "bind-board": _cmd_bind_board,
+        "factory-sync": _cmd_factory_sync,
+        "factory-archive": _cmd_factory_archive,
+        "factory-show": _cmd_factory_show,
     }
     handler = handlers.get(action)
     if handler is None:
@@ -300,6 +318,53 @@ def _cmd_archive(args, conn, proj) -> int:
 def _cmd_restore(args, conn, proj) -> int:
     pdb.restore_project(conn, proj.id)
     print(f"Restored {proj.slug}")
+    return 0
+
+
+def _cmd_factory_sync(args: argparse.Namespace) -> int:
+    try:
+        with pdb.connect_closing() as conn:
+            project = pdb.sync_factory_project(
+                conn, slug=args.slug, root=args.root, matrix_room_id=args.matrix_room_id,
+            )
+    except ValueError as exc:
+        print(f"project: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(project.to_dict(), sort_keys=True))
+    else:
+        print(f"Synchronized factory project {project.slug} ({project.id})")
+    return 0
+
+
+def _cmd_factory_archive(args: argparse.Namespace) -> int:
+    try:
+        with pdb.connect_closing() as conn:
+            project = pdb.archive_factory_project(conn, args.slug)
+    except ValueError as exc:
+        print(f"project: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(project.to_dict(), sort_keys=True))
+    else:
+        print(f"Archived factory project {project.slug}")
+    return 0
+
+
+def _cmd_factory_show(args: argparse.Namespace) -> int:
+    try:
+        with pdb.connect_closing() as conn:
+            project = pdb.get_factory_project(conn, args.slug)
+    except ValueError as exc:
+        print(f"project: {exc}", file=sys.stderr)
+        return 2
+    if project is None:
+        print(f"project: no factory project for slug: {args.slug}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(project.to_dict(), sort_keys=True))
+    else:
+        _print_project(project)
     return 0
 
 

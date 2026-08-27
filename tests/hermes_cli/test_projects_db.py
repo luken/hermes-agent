@@ -55,6 +55,66 @@ def test_create_get_list(conn):
     assert len(pdb.list_projects(conn)) == 1
 
 
+def test_factory_sync_is_idempotent_and_preserves_factory_links(conn):
+    first = pdb.sync_factory_project(
+        conn,
+        slug="hindsight",
+        root="/hermes/projects/hindsight",
+        matrix_room_id="!hindsight:omner.org",
+    )
+    second = pdb.sync_factory_project(
+        conn,
+        slug="hindsight",
+        root="/hermes/projects/hindsight",
+        matrix_room_id="!hindsight:omner.org",
+    )
+
+    assert second.id == first.id
+    assert second.factory_slug == "hindsight"
+    assert second.matrix_room_id == "!hindsight:omner.org"
+    assert second.factory_lifecycle == "active"
+    assert second.primary_path == "/hermes/projects/hindsight"
+    assert {folder.path for folder in second.folders} >= {
+        "/hermes/projects/hindsight",
+        "/hermes/projects/hindsight/source",
+        "/hermes/projects/hindsight/deploy",
+    }
+
+    archived = pdb.archive_factory_project(conn, "hindsight")
+    assert archived.archived is True
+    assert archived.factory_lifecycle == "archived"
+    restored = pdb.sync_factory_project(
+        conn,
+        slug="hindsight",
+        root="/hermes/projects/hindsight",
+        matrix_room_id="!hindsight:omner.org",
+    )
+    assert restored.archived is False
+
+
+def test_factory_sync_refuses_ordinary_slug_and_room_conflicts(conn):
+    pdb.create_project(conn, name="Hindsight", slug="hindsight", folders=["/tmp/ordinary"])
+    with pytest.raises(ValueError, match="ordinary project"):
+        pdb.sync_factory_project(
+            conn, slug="hindsight", root="/hermes/projects/hindsight",
+            matrix_room_id="!hindsight:omner.org",
+        )
+
+    pdb.sync_factory_project(
+        conn, slug="one", root="/hermes/projects/one", matrix_room_id="!shared:omner.org",
+    )
+    with pytest.raises(ValueError, match="already linked"):
+        pdb.sync_factory_project(
+            conn, slug="two", root="/hermes/projects/two", matrix_room_id="!shared:omner.org",
+        )
+
+    pdb.create_project(conn, name="Other", folders=["/hermes/projects/path-conflict"])
+    with pytest.raises(ValueError, match="primary path"):
+        pdb.sync_factory_project(
+            conn, slug="path-conflict", root="/hermes/projects/path-conflict", matrix_room_id="!path:omner.org",
+        )
+
+
 
 
 
@@ -142,5 +202,3 @@ def test_per_profile_isolation(tmp_path):
     finally:
         a.close()
         b.close()
-
-

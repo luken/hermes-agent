@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import array
 import inspect
+import json
 import logging
 import mimetypes
 import os
@@ -1273,6 +1274,17 @@ class MatrixAdapter(BasePlatformAdapter):
             self._free_rooms: Set[str] = {
                 r.strip() for r in str(free_rooms_raw).split(",") if r.strip()
             }
+        # Factory rooms are not configured by room names, aliases, topics, or
+        # user-provided Matrix state.  The controller-owned catalog is the
+        # authority and entries are fail-closed unless they name an active
+        # dispatcher project and linked native project ID.
+        # The default is intentionally a control-volume path, not a Matrix
+        # room property or an environment knob. On ordinary installations the
+        # directory is absent and this remains fail-closed.
+        catalog_path = config.extra.get(
+            "factory_project_catalog_path", "/hermes/.control/catalog"
+        )
+        self._factory_project_catalog_path = Path(str(catalog_path)).expanduser() if catalog_path else None
         # If non-empty, bot ONLY responds in these rooms (whitelist); DMs exempt.
         allowed_rooms_raw = config.extra.get("allowed_rooms")
         if allowed_rooms_raw is None:
@@ -1288,7 +1300,10 @@ class MatrixAdapter(BasePlatformAdapter):
         self._allow_room_mentions: bool = os.getenv(
             "MATRIX_ALLOW_ROOM_MENTIONS", "false"
         ).lower() in ("true", "1", "yes")
-        self._auto_thread: bool = os.getenv("MATRIX_AUTO_THREAD", "true").lower() in (
+        auto_thread_raw = config.extra.get("auto_thread")
+        if auto_thread_raw is None:
+            auto_thread_raw = os.getenv("MATRIX_AUTO_THREAD", "true")
+        self._auto_thread: bool = str(auto_thread_raw).lower() in (
             "true",
             "1",
             "yes",
@@ -1299,7 +1314,9 @@ class MatrixAdapter(BasePlatformAdapter):
         self._dm_mention_threads: bool = os.getenv(
             "MATRIX_DM_MENTION_THREADS", "false"
         ).lower() in ("true", "1", "yes")
-        raw_session_scope = os.getenv("MATRIX_SESSION_SCOPE", "auto").strip().lower()
+        raw_session_scope = str(
+            config.extra.get("session_scope", os.getenv("MATRIX_SESSION_SCOPE", "auto"))
+        ).strip().lower()
         self._matrix_session_scope = (
             raw_session_scope if raw_session_scope in {"auto", "room", "thread"} else "auto"
         )
@@ -3346,6 +3363,36 @@ class MatrixAdapter(BasePlatformAdapter):
                 room_id, sender, event_id, event_ts, source_content, relates_to
             )
 
+    def _is_active_factory_project_room(self, room_id: str) -> bool:
+        """Whether ``room_id`` is an active dispatcher factory room.
+
+        Catalog files are written atomically by the factory controller.  Any
+        malformed file or filesystem error is deliberately ignored: a transient
+        catalog issue must restore mention-gating, never make a room freer.
+        """
+        catalog_dir = self._factory_project_catalog_path
+        if catalog_dir is None or not catalog_dir.is_dir():
+            return False
+        try:
+            for candidate in catalog_dir.glob("*.json"):
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    continue
+                if (
+                    payload.get("schema") == "hermes.omner.org/factory-project-catalog/v1"
+                    and payload.get("lifecycle") == "active"
+                    and payload.get("profile") == "default"
+                    and isinstance(payload.get("native_project_id"), str)
+                    and payload.get("native_project_id", "").startswith("p_")
+                    and payload.get("matrix_room_id") == room_id
+                ):
+                    return True
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+        return False
+
     async def _resolve_message_context(
         self,
         room_id: str,
@@ -3381,7 +3428,8 @@ class MatrixAdapter(BasePlatformAdapter):
             # allowed_rooms check (whitelist — must pass before other gating).
             # When set, messages from rooms NOT in this whitelist are silently
             # ignored, even if @mentioned.  DMs are already excluded above.
-            if self._allowed_rooms and room_id not in self._allowed_rooms:
+            is_factory_room = self._is_active_factory_project_room(room_id)
+            if self._allowed_rooms and room_id not in self._allowed_rooms and not is_factory_room:
                 logger.debug(
                     "Matrix: ignoring message %s in %s — room not in "
                     "MATRIX_ALLOWED_ROOMS whitelist",
@@ -3390,7 +3438,10 @@ class MatrixAdapter(BasePlatformAdapter):
                 )
                 return None
 
-            is_free_room = room_id in self._free_rooms
+            # Matrix is globally mention-gated.  Unlike other platforms, the
+            # legacy free_response_rooms list cannot elevate a room: only a
+            # verified active factory catalog record may do that.
+            is_free_room = is_factory_room
             in_bot_thread = bool(thread_id and thread_id in self._threads)
             is_command = body.startswith("/")
             if self._require_mention and not is_free_room and not in_bot_thread:

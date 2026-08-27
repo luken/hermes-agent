@@ -39,6 +39,50 @@ def _set_dm(adapter, room_id="!room1:example.org", is_dm=True):
     adapter._dm_rooms[room_id] = is_dm
 
 
+@pytest.mark.asyncio
+async def test_only_active_factory_catalog_room_bypasses_matrix_mention(tmp_path):
+    from plugins.platforms.matrix.adapter import MatrixAdapter
+
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    (catalog / "hindsight.json").write_text(json.dumps({
+        "schema": "hermes.omner.org/factory-project-catalog/v1",
+        "slug": "hindsight",
+        "profile": "default",
+        "native_project_id": "p_1234abcd",
+        "matrix_room_id": "!factory:example.org",
+        "lifecycle": "active",
+    }))
+    adapter = MatrixAdapter(PlatformConfig(
+        enabled=True, token="tok", extra={
+            "homeserver": "https://matrix.example.org", "user_id": "@hermes:example.org",
+            "factory_project_catalog_path": str(catalog), "allowed_rooms": ["!ordinary:example.org"],
+            "session_scope": "room", "auto_thread": False,
+        },
+    ))
+    adapter._dm_rooms["!factory:example.org"] = False
+    adapter._dm_rooms["!ordinary:example.org"] = False
+    adapter._resolve_room_identity = AsyncMock(return_value=SimpleNamespace(display_name="factory", room_topic="", server_name="", chat_type="group"))
+    adapter._get_display_name = AsyncMock(return_value="Alice")
+    adapter._background_read_receipt = MagicMock()
+
+    factory = await adapter._resolve_message_context(
+        "!factory:example.org", "@alice:example.org", "$factory", "please continue", {"body": "please continue"}, {},
+    )
+    ordinary = await adapter._resolve_message_context(
+        "!ordinary:example.org", "@alice:example.org", "$ordinary", "please continue", {"body": "please continue"}, {},
+    )
+    assert factory is not None and factory[-1].thread_id is None
+    assert ordinary is None
+
+    payload = json.loads((catalog / "hindsight.json").read_text())
+    payload["lifecycle"] = "archived"
+    (catalog / "hindsight.json").write_text(json.dumps(payload))
+    assert await adapter._resolve_message_context(
+        "!factory:example.org", "@alice:example.org", "$archived", "please continue", {"body": "please continue"}, {},
+    ) is None
+
+
 def _make_event(
     body,
     sender="@alice:example.org",
@@ -382,5 +426,3 @@ class TestMatrixConfigBridge:
             == "!room1:example.org,!room2:example.org"
         )
         assert os.getenv("MATRIX_AUTO_THREAD") == "false"
-
-
