@@ -49,6 +49,9 @@ export interface SidebarProjectTree {
   color?: null | string
   icon?: null | string
   archived?: boolean
+  factorySlug?: null | string
+  matrixRoomId?: null | string
+  factoryLifecycle?: null | string
   // A git repo root promoted automatically (not a user-created projects.db row).
   // Deletable = dismissable.
   isAuto?: boolean

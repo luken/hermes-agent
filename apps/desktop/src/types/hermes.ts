@@ -983,6 +983,9 @@ export interface ProjectInfo {
   color: null | string
   board_slug: null | string
   primary_path: null | string
+  factory_slug?: null | string
+  matrix_room_id?: null | string
+  factory_lifecycle?: null | string
   archived: boolean
   created_at: number
   folders: ProjectFolder[]
