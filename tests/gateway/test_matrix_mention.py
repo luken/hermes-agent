@@ -52,6 +52,13 @@ async def test_only_active_factory_catalog_room_bypasses_matrix_mention(tmp_path
         "native_project_id": "p_1234abcd",
         "matrix_room_id": "!factory:example.org",
         "lifecycle": "active",
+        "matrix_membership": {
+            "algorithm": "m.megolm.v1.aes-sha2",
+            "members": {
+                "@hermes:example.org": {"membership": "join", "event_id": "$hermes"},
+                "@alice:example.org": {"membership": "invite", "event_id": "$alice"},
+            },
+        },
     }))
     adapter = MatrixAdapter(PlatformConfig(
         enabled=True, token="tok", extra={
@@ -60,6 +67,7 @@ async def test_only_active_factory_catalog_room_bypasses_matrix_mention(tmp_path
             "session_scope": "room", "auto_thread": False,
         },
     ))
+    adapter._allowed_user_ids = {"@alice:example.org"}
     adapter._dm_rooms["!factory:example.org"] = False
     adapter._dm_rooms["!ordinary:example.org"] = False
     adapter._resolve_room_identity = AsyncMock(return_value=SimpleNamespace(display_name="factory", room_topic="", server_name="", chat_type="group"))
@@ -80,6 +88,13 @@ async def test_only_active_factory_catalog_room_bypasses_matrix_mention(tmp_path
     (catalog / "hindsight.json").write_text(json.dumps(payload))
     assert await adapter._resolve_message_context(
         "!factory:example.org", "@alice:example.org", "$archived", "please continue", {"body": "please continue"}, {},
+    ) is None
+
+    payload["lifecycle"] = "active"
+    payload.pop("matrix_membership")
+    (catalog / "hindsight.json").write_text(json.dumps(payload))
+    assert await adapter._resolve_message_context(
+        "!factory:example.org", "@alice:example.org", "$unverified", "please continue", {"body": "please continue"}, {},
     ) is None
 
 
