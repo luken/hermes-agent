@@ -3380,6 +3380,15 @@ class MatrixAdapter(BasePlatformAdapter):
                 payload = json.loads(candidate.read_text(encoding="utf-8"))
                 if not isinstance(payload, dict):
                     continue
+                membership = payload.get("matrix_membership")
+                members = membership.get("members") if isinstance(membership, dict) else None
+                if not isinstance(members, dict):
+                    continue
+                hermes_membership = members.get(self._user_id)
+                other_members = [
+                    (user_id, value) for user_id, value in members.items()
+                    if user_id != self._user_id
+                ]
                 if (
                     payload.get("schema") == "hermes.omner.org/factory-project-catalog/v1"
                     and payload.get("lifecycle") == "active"
@@ -3387,6 +3396,16 @@ class MatrixAdapter(BasePlatformAdapter):
                     and isinstance(payload.get("native_project_id"), str)
                     and payload.get("native_project_id", "").startswith("p_")
                     and payload.get("matrix_room_id") == room_id
+                    and membership.get("algorithm") == "m.megolm.v1.aes-sha2"
+                    and isinstance(hermes_membership, dict)
+                    and hermes_membership.get("membership") == "join"
+                    and isinstance(hermes_membership.get("event_id"), str)
+                    and len(other_members) == 1
+                    and isinstance(other_members[0][0], str)
+                    and other_members[0][0] in self._allowed_user_ids
+                    and isinstance(other_members[0][1], dict)
+                    and other_members[0][1].get("membership") in {"invite", "join"}
+                    and isinstance(other_members[0][1].get("event_id"), str)
                 ):
                     return True
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
