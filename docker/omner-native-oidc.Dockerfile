@@ -2,7 +2,7 @@ FROM docker.io/nousresearch/hermes-agent:v2026.8.19@sha256:3811ed13da874fba2ac99
 
 ARG HERMES_GIT_SHA
 LABEL org.opencontainers.image.revision="${HERMES_GIT_SHA}"
-LABEL org.opencontainers.image.source="https://github.com/luken/hermes-agent/tree/codex/sonos-project-room-composite"
+LABEL org.opencontainers.image.source="https://github.com/luken/hermes-agent/tree/codex/matrix-supervisor-identity-gate"
 LABEL org.opencontainers.image.base.revision="fcbd1076a93841fa88855acce810e342a5b78101"
 
 # The pinned upstream runtime predates two fixed critical packages. Keep this

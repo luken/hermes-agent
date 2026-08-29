@@ -2,7 +2,7 @@ name: Omner native OIDC image
 
 on:
   push:
-    branches: [codex/sonos-project-room-composite]
+    branches: [codex/matrix-supervisor-identity-gate]
   workflow_dispatch:
 
 permissions:
@@ -37,7 +37,7 @@ jobs:
           file: docker/omner-native-oidc.Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/luken/hermes-agent:omner-project-room-receipt-v2026.8.19-r1
+          tags: ghcr.io/luken/hermes-agent:omner-matrix-supervisor-gate-v2026.8.19-r1
           sbom: true
           provenance: mode=max
           build-args: |
@@ -76,7 +76,7 @@ jobs:
           DIGEST: ${{ steps.image.outputs.digest }}
         run: |
           cosign verify \
-            --certificate-identity 'https://github.com/luken/hermes-agent/.github/workflows/omner-native-oidc-image.yml@refs/heads/codex/sonos-project-room-composite' \
+            --certificate-identity 'https://github.com/luken/hermes-agent/.github/workflows/omner-native-oidc-image.yml@refs/heads/codex/matrix-supervisor-identity-gate' \
             --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
             "ghcr.io/luken/hermes-agent@${DIGEST}"
           echo "ghcr.io/luken/hermes-agent@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
