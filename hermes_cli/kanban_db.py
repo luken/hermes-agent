@@ -6768,6 +6768,121 @@ def request_changes(
     return True, implementer
 
 
+def pass_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: str,
+    expected_run_id: Optional[int] = None,
+) -> tuple[bool, Optional[str]]:
+    """Finish a clean review without completing the implementation card.
+
+    This is the no-blocker sibling of :func:`request_changes`. It is valid
+    only for a run claimed from ``review``, restores the implementer retained
+    by the latest ``review_requested`` event, reapplies parent gating, and
+    preserves the failure counter.
+    """
+    summary = str(redact_review_value(summary or "")).strip()
+    if not summary:
+        return False, "summary is required"
+
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
+            return False, "task not found"
+        current_run_id = task_row["current_run_id"]
+        if task_row["status"] != "running" or current_run_id is None:
+            return False, "task is not in an active review run"
+        if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
+            return False, "run_id mismatch"
+
+        claimed_event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(current_run_id)),
+        ).fetchone()
+        try:
+            claimed_payload = (
+                json.loads(claimed_event["payload"])
+                if claimed_event and claimed_event["payload"]
+                else {}
+            )
+        except (json.JSONDecodeError, TypeError):
+            claimed_payload = {}
+        if not isinstance(claimed_payload, dict) or claimed_payload.get("source_status") != "review":
+            return False, "active run was not claimed from review"
+
+        requested_event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if requested_event is None:
+            return False, "no prior review_requested event"
+        try:
+            requested_payload = (
+                json.loads(requested_event["payload"])
+                if requested_event["payload"]
+                else {}
+            )
+        except (json.JSONDecodeError, TypeError):
+            requested_payload = {}
+        implementer = (
+            requested_payload.get("implementer")
+            if isinstance(requested_payload, dict)
+            else None
+        )
+        if not isinstance(implementer, str) or not implementer.strip():
+            return False, "review handoff has no valid implementer provenance"
+        reviewer = task_row["assignee"]
+        reviewer = (
+            _canonical_assignee(reviewer)
+            if isinstance(reviewer, str) and reviewer.strip()
+            else None
+        )
+
+        new_status = _landing_status_after_parents(conn, task_id)
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?,
+                   assignee = ?,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE id = ? AND status = 'running' AND current_run_id = ?
+            """,
+            (new_status, implementer, task_id, int(current_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False, "task changed during review handoff"
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="review_passed",
+            status=new_status,
+            summary=summary,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "review_passed",
+            {
+                "summary": summary,
+                "implementer": implementer,
+                "reviewer": reviewer,
+                "status": new_status,
+            },
+            run_id=run_id,
+        )
+    return True, implementer
+
+
 def promote_task(
     conn: sqlite3.Connection,
     task_id: str,

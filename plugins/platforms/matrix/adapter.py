@@ -1298,6 +1298,10 @@ class MatrixAdapter(BasePlatformAdapter):
             "factory_project_catalog_path", "/hermes/.control/catalog"
         )
         self._factory_project_catalog_path = Path(str(catalog_path)).expanduser() if catalog_path else None
+        project_root = config.extra.get(
+            "factory_project_root_path", "/hermes/projects"
+        )
+        self._factory_project_root_path = Path(str(project_root)).expanduser()
         # If non-empty, bot ONLY responds in these rooms (whitelist); DMs exempt.
         allowed_rooms_raw = config.extra.get("allowed_rooms")
         if allowed_rooms_raw is None:
@@ -3376,23 +3380,41 @@ class MatrixAdapter(BasePlatformAdapter):
                 room_id, sender, event_id, event_ts, source_content, relates_to
             )
 
-    def _is_active_factory_project_room(self, room_id: str) -> bool:
-        """Whether ``room_id`` is an active dispatcher factory room.
+    def _factory_project_room_record(self, room_id: str) -> tuple[bool, Optional[dict]]:
+        """Return whether a catalog room is known and its validated active record.
 
         Catalog files are written atomically by the factory controller.  Any
-        malformed file or filesystem error is deliberately ignored: a transient
-        catalog issue must restore mention-gating, never make a room freer.
+        exact room match that is inactive or malformed fails closed instead of
+        falling through to Matrix's two-member DM admission path.
         """
         catalog_dir = self._factory_project_catalog_path
         if catalog_dir is None or not catalog_dir.is_dir():
-            return False
+            return False, None
+        matched = 0
+        valid: list[dict] = []
         try:
             for candidate in catalog_dir.glob("*.json"):
                 if candidate.is_symlink() or not candidate.is_file():
                     continue
-                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                try:
+                    payload = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    # One damaged unrelated record must not demote a later
+                    # valid factory room into Matrix's two-member DM path.
+                    continue
                 if not isinstance(payload, dict):
                     continue
+                if payload.get("matrix_room_id") != room_id:
+                    continue
+                matched += 1
+                slug = payload.get("slug")
+                if (
+                    not isinstance(slug, str)
+                    or not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?", slug)
+                    or candidate.stem != slug
+                ):
+                    continue
+                expected_root = self._factory_project_root_path / slug
                 membership = payload.get("matrix_membership")
                 members = membership.get("members") if isinstance(membership, dict) else None
                 if not isinstance(members, dict):
@@ -3409,6 +3431,9 @@ class MatrixAdapter(BasePlatformAdapter):
                     and isinstance(payload.get("native_project_id"), str)
                     and payload.get("native_project_id", "").startswith("p_")
                     and payload.get("matrix_room_id") == room_id
+                    and payload.get("root_path") == str(expected_root)
+                    and expected_root.is_dir()
+                    and not expected_root.is_symlink()
                     and membership.get("algorithm") == "m.megolm.v1.aes-sha2"
                     and isinstance(hermes_membership, dict)
                     and hermes_membership.get("membership") == "join"
@@ -3420,10 +3445,54 @@ class MatrixAdapter(BasePlatformAdapter):
                     and other_members[0][1].get("membership") in {"invite", "join"}
                     and isinstance(other_members[0][1].get("event_id"), str)
                 ):
-                    return True
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return False
-        return False
+                    valid.append(payload)
+        except (OSError, ValueError, TypeError):
+            return bool(matched), None
+        if matched != 1 or len(valid) != 1:
+            return bool(matched), None
+        return True, valid[0]
+
+    def _is_active_factory_project_room(self, room_id: str) -> bool:
+        """Whether ``room_id`` has exactly one validated active catalog link."""
+        _matched, record = self._factory_project_room_record(room_id)
+        return record is not None
+
+    def _factory_project_context(self, record: dict) -> dict:
+        """Build the bounded non-secret per-turn catalog snapshot."""
+        root = Path(record["root_path"])
+        latest_receipt = None
+        receipts = record.get("receipts")
+        if isinstance(receipts, list) and receipts:
+            candidate = receipts[-1]
+            if isinstance(candidate, dict):
+                state = candidate.get("state")
+                recorded_at = candidate.get("recorded_at")
+                path = candidate.get("path")
+                if (
+                    isinstance(state, str)
+                    and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", state)
+                    and isinstance(recorded_at, str)
+                    and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", recorded_at)
+                    and isinstance(path, str)
+                ):
+                    try:
+                        relative_path = str(Path(path).relative_to(root))
+                    except ValueError:
+                        relative_path = None
+                    if relative_path and ".." not in Path(relative_path).parts:
+                        latest_receipt = {
+                            "state": state,
+                            "recorded_at": recorded_at,
+                            "project_relative_path": relative_path,
+                        }
+        return {
+            "slug": record["slug"],
+            "native_project_id": record["native_project_id"],
+            "matrix_room_id": record["matrix_room_id"],
+            "lifecycle": "active",
+            "root_path": record["root_path"],
+            "latest_receipt": latest_receipt,
+        }
 
     async def _resolve_message_context(
         self,
@@ -3440,7 +3509,18 @@ class MatrixAdapter(BasePlatformAdapter):
         or None if the message should be dropped (mention gating).
         """
         identity = await self._resolve_room_identity(room_id)
-        is_dm = await self._is_dm_room(room_id)
+        catalog_room, factory_record = self._factory_project_room_record(room_id)
+        if catalog_room and factory_record is None:
+            logger.warning(
+                "Matrix: ignoring message %s in %s because its factory "
+                "catalog record is inactive, ambiguous, or invalid",
+                event_id,
+                room_id,
+            )
+            return None
+        # Factory rooms are durable room-scoped project conversations even
+        # though their exact membership also resembles a two-member Matrix DM.
+        is_dm = False if factory_record is not None else await self._is_dm_room(room_id)
         chat_type = "dm" if is_dm else "group"
 
         thread_id = None
@@ -3488,7 +3568,7 @@ class MatrixAdapter(BasePlatformAdapter):
             # allowed_rooms check (whitelist — must pass before other gating).
             # When set, messages from rooms NOT in this whitelist are silently
             # ignored, even if @mentioned.  DMs are already excluded above.
-            is_factory_room = self._is_active_factory_project_room(room_id)
+            is_factory_room = factory_record is not None
             if self._allowed_rooms and room_id not in self._allowed_rooms and not is_factory_room:
                 logger.debug(
                     "Matrix: ignoring message %s in %s — room not in "
@@ -3580,6 +3660,9 @@ class MatrixAdapter(BasePlatformAdapter):
             parent_chat_id=room_id if thread_id else None,
             message_id=event_id,
         )
+        if factory_record is not None:
+            source.runtime_cwd = factory_record["root_path"]
+            source.factory_project_context = self._factory_project_context(factory_record)
 
         if thread_id:
             self._threads.mark(thread_id)

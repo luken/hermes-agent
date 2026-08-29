@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 import time
 from datetime import datetime
 from types import SimpleNamespace
@@ -91,6 +93,36 @@ async def _source_for(adapter, room_id: str, event_id: str = "$event"):
     return ctx[-1]
 
 
+def _write_factory_record(catalog, project_root, *, lifecycle="active", receipt_state="verified"):
+    slug = "project-a"
+    root = project_root / slug
+    root.mkdir(parents=True, exist_ok=True)
+    record = {
+        "schema": "hermes.omner.org/factory-project-catalog/v1",
+        "slug": slug,
+        "root_path": str(root),
+        "profile": "default",
+        "native_project_id": "p_deadbeef",
+        "matrix_room_id": PROJECT_A_ROOM_ID,
+        "lifecycle": lifecycle,
+        "matrix_membership": {
+            "algorithm": "m.megolm.v1.aes-sha2",
+            "members": {
+                "@bot:example.org": {"membership": "join", "event_id": "$bot"},
+                SENDER: {"membership": "join", "event_id": "$operator"},
+            },
+        },
+        "receipts": [{
+            "state": receipt_state,
+            "recorded_at": "2026-08-29T12:00:00Z",
+            "path": str(root / "deploy" / "releases" / "verified.json"),
+        }],
+    }
+    catalog.mkdir(parents=True, exist_ok=True)
+    (catalog / f"{slug}.json").write_text(json.dumps(record), encoding="utf-8")
+    return record
+
+
 def _matrix_event(room_id: str, event_id: str, body: str = "What is next?"):
     event = MagicMock()
     event.room_id = room_id
@@ -170,6 +202,90 @@ async def test_matrix_project_context_survives_concurrent_messages():
     assert observed_a.chat_name == PROJECT_A_NAME
     assert observed_b.chat_name == PROJECT_B_NAME
     assert observed_a.session_key != observed_b.session_key
+
+
+@pytest.mark.asyncio
+async def test_factory_room_is_room_scoped_and_binds_trusted_project_root(tmp_path):
+    from agent.runtime_cwd import resolve_agent_cwd
+    from gateway.run import GatewayRunner
+
+    catalog = tmp_path / "catalog"
+    project_root = tmp_path / "projects"
+    record = _write_factory_record(catalog, project_root)
+    adapter = _make_adapter()
+    adapter._factory_project_catalog_path = catalog
+    adapter._factory_project_root_path = project_root
+    adapter._allowed_user_ids = {SENDER}
+
+    source = await _source_for(adapter, PROJECT_A_ROOM_ID)
+    assert source.chat_type == "group"
+    assert source.runtime_cwd == record["root_path"]
+    assert source.factory_project_context == {
+        "slug": "project-a",
+        "native_project_id": "p_deadbeef",
+        "matrix_room_id": PROJECT_A_ROOM_ID,
+        "lifecycle": "active",
+        "root_path": record["root_path"],
+        "latest_receipt": {
+            "state": "verified",
+            "recorded_at": "2026-08-29T12:00:00Z",
+            "project_relative_path": "deploy/releases/verified.json",
+        },
+    }
+
+    wire = source.to_dict()
+    assert "runtime_cwd" not in wire
+    assert "factory_project_context" not in wire
+    wire["runtime_cwd"] = "/tmp/forged"
+    wire["factory_project_context"] = {"slug": "forged"}
+    restored = SessionSource.from_dict(wire)
+    assert restored.runtime_cwd is None
+    assert restored.factory_project_context is None
+
+    runner = object.__new__(GatewayRunner)
+    tokens = runner._set_session_env(_context_for(source))
+    try:
+        assert resolve_agent_cwd() == Path(record["root_path"])
+    finally:
+        runner._clear_session_env(tokens)
+
+
+@pytest.mark.asyncio
+async def test_archived_factory_room_does_not_fall_through_as_two_member_dm(tmp_path):
+    catalog = tmp_path / "catalog"
+    project_root = tmp_path / "projects"
+    _write_factory_record(catalog, project_root, lifecycle="archived")
+    adapter = _make_adapter()
+    adapter._factory_project_catalog_path = catalog
+    adapter._factory_project_root_path = project_root
+    adapter._allowed_user_ids = {SENDER}
+
+    result = await adapter._resolve_message_context(
+        room_id=PROJECT_A_ROOM_ID,
+        sender=SENDER,
+        event_id="$archived",
+        body="What is next?",
+        source_content={"body": "What is next?"},
+        relates_to={},
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_unrelated_malformed_catalog_record_does_not_demote_factory_room(tmp_path):
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    (catalog / "000-damaged.json").write_text("{not-json", encoding="utf-8")
+    project_root = tmp_path / "projects"
+    record = _write_factory_record(catalog, project_root)
+    adapter = _make_adapter()
+    adapter._factory_project_catalog_path = catalog
+    adapter._factory_project_root_path = project_root
+    adapter._allowed_user_ids = {SENDER}
+
+    source = await _source_for(adapter, PROJECT_A_ROOM_ID, "$damaged-neighbor")
+    assert source.chat_type == "group"
+    assert source.runtime_cwd == record["root_path"]
 
 
 @pytest.mark.asyncio
@@ -338,5 +454,3 @@ async def test_matrix_resume_cross_room_requires_explicit_flag_and_warns():
     assert "Cross-room resume" in result
     assert PROJECT_B_NAME in result
     runner.session_store.switch_session.assert_called_once()
-
-

@@ -104,6 +104,7 @@ def test_review_tools_are_gated_and_visible_to_kanban_workers(
     }
     assert "kanban_request_review" in names
     assert "kanban_request_changes" in names
+    assert "kanban_review_pass" in names
 
     from acp_adapter.tools import _POLISHED_TOOLS
     from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
@@ -111,6 +112,52 @@ def test_review_tools_are_gated_and_visible_to_kanban_workers(
     assert "kanban_request_changes" in _POLISHED_TOOLS
     assert "kanban_request_changes" in EXPOSED_TOOLS
     assert "kanban_request_changes" in resolve_toolset("kanban")
+    assert "kanban_review_pass" in _POLISHED_TOOLS
+    assert "kanban_review_pass" in EXPOSED_TOOLS
+    assert "kanban_review_pass" in resolve_toolset("kanban")
+
+
+def test_clean_patch_review_returns_same_card_without_completing_or_resetting_failures(
+    review_worker: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import kanban_tools as tools
+
+    requested = json.loads(tools._handle_request_review({
+        "summary": "Patch base deadbeef, head cafebabe; focused checks pass.",
+        "reviewer": "reviewer",
+    }))
+    assert requested["ok"] is True
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 2 WHERE id = ?",
+            (review_worker,),
+        )
+        review = kb.claim_review_task(conn, review_worker, claimer="reviewer:1")
+        assert review is not None
+
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    passed = json.loads(tools._handle_review_pass({
+        "summary": "No blockers in the stated patch purpose or evidence.",
+    }))
+    assert passed["ok"] is True
+    assert passed["implementer"] == "builder"
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, review_worker)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.assignee == "builder"
+        assert task.consecutive_failures == 2
+        run = kb.latest_run(conn, review_worker)
+        assert run is not None
+        assert run.outcome == "review_passed"
+        event = [
+            item for item in kb.list_events(conn, review_worker)
+            if item.kind == "review_passed"
+        ][-1]
+        assert event.payload["implementer"] == "builder"
 
 
 def test_review_cli_round_trip_preserves_handoff(
@@ -235,6 +282,7 @@ def test_worker_guidance_distinguishes_same_card_and_downstream_review() -> None
     assert "call `kanban_complete`" in KANBAN_GUIDANCE
     assert "Never sticky-block that parent for `review-required`" in KANBAN_GUIDANCE
     assert "`kanban_request_changes`" in KANBAN_GUIDANCE
+    assert "`kanban_review_pass`" in KANBAN_GUIDANCE
     assert "metadata=..." in KANBAN_GUIDANCE
     kanban_defaults = DEFAULT_CONFIG["kanban"]
     assert isinstance(kanban_defaults, dict)
@@ -244,6 +292,7 @@ def test_worker_guidance_distinguishes_same_card_and_downstream_review() -> None
     review_skill = repo_root / "skills" / "devops" / "sdlc-review" / "SKILL.md"
     skill_text = review_skill.read_text(encoding="utf-8")
     assert "kanban_request_changes" in skill_text
+    assert "kanban_review_pass" in skill_text
     assert "approve" in skill_text.lower()
     assert "escalate" in skill_text.lower()
 
