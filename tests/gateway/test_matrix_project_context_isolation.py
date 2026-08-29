@@ -272,6 +272,23 @@ async def test_archived_factory_room_does_not_fall_through_as_two_member_dm(tmp_
 
 
 @pytest.mark.asyncio
+async def test_unrelated_malformed_catalog_record_does_not_demote_factory_room(tmp_path):
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    (catalog / "000-damaged.json").write_text("{not-json", encoding="utf-8")
+    project_root = tmp_path / "projects"
+    record = _write_factory_record(catalog, project_root)
+    adapter = _make_adapter()
+    adapter._factory_project_catalog_path = catalog
+    adapter._factory_project_root_path = project_root
+    adapter._allowed_user_ids = {SENDER}
+
+    source = await _source_for(adapter, PROJECT_A_ROOM_ID, "$damaged-neighbor")
+    assert source.chat_type == "group"
+    assert source.runtime_cwd == record["root_path"]
+
+
+@pytest.mark.asyncio
 async def test_matrix_inbound_handler_emits_project_b_metadata_not_project_a():
     adapter = _make_adapter()
     captured = []

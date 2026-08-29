@@ -3396,7 +3396,12 @@ class MatrixAdapter(BasePlatformAdapter):
             for candidate in catalog_dir.glob("*.json"):
                 if candidate.is_symlink() or not candidate.is_file():
                     continue
-                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                try:
+                    payload = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    # One damaged unrelated record must not demote a later
+                    # valid factory room into Matrix's two-member DM path.
+                    continue
                 if not isinstance(payload, dict):
                     continue
                 if payload.get("matrix_room_id") != room_id:
@@ -3441,7 +3446,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     and isinstance(other_members[0][1].get("event_id"), str)
                 ):
                     valid.append(payload)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError):
             return bool(matched), None
         if matched != 1 or len(valid) != 1:
             return bool(matched), None
