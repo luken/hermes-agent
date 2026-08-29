@@ -2398,6 +2398,7 @@ DEFAULT_CONFIG = {
     # Matrix platform settings (gateway mode)
     "matrix": {
         "require_mention": True,       # Require @mention to respond in rooms
+        "supervisor_user_id": "",      # If set, only rooms shared with this peer require mention
         "free_response_rooms": "",     # Comma-separated room IDs where bot responds without mention
         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
         "factory_project_catalog_path": "",  # Trusted catalog directory for active factory project rooms

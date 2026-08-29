@@ -1,6 +1,5 @@
 """Tests for Matrix require-mention gating and auto-thread features."""
 
-import json
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -40,62 +39,171 @@ def _set_dm(adapter, room_id="!room1:example.org", is_dm=True):
 
 
 @pytest.mark.asyncio
-async def test_only_active_factory_catalog_room_bypasses_matrix_mention(tmp_path):
+@pytest.mark.parametrize(
+    ("joined_member_ids", "admitted"),
+    [
+        (frozenset({"@hermes:example.org", "@alice:example.org"}), True),
+        (
+            frozenset(
+                {
+                    "@hermes:example.org",
+                    "@alice:example.org",
+                    "@bob:example.org",
+                }
+            ),
+            True,
+        ),
+        (
+            frozenset(
+                {
+                    "@hermes:example.org",
+                    "@hermes-supervisor:example.org",
+                    "@alice:example.org",
+                }
+            ),
+            False,
+        ),
+        (None, False),
+    ],
+)
+async def test_supervisor_membership_is_the_only_matrix_mention_gate(
+    tmp_path,
+    joined_member_ids,
+    admitted,
+):
     from plugins.platforms.matrix.adapter import MatrixAdapter
 
-    catalog = tmp_path / "catalog"
-    catalog.mkdir()
-    (catalog / "hindsight.json").write_text(json.dumps({
-        "schema": "hermes.omner.org/factory-project-catalog/v1",
-        "slug": "hindsight",
-        "profile": "default",
-        "native_project_id": "p_1234abcd",
-        "matrix_room_id": "!factory:example.org",
-        "lifecycle": "active",
-        "matrix_membership": {
-            "algorithm": "m.megolm.v1.aes-sha2",
-            "members": {
-                "@hermes:example.org": {"membership": "join", "event_id": "$hermes"},
-                "@alice:example.org": {"membership": "invite", "event_id": "$alice"},
+    adapter = MatrixAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@hermes:example.org",
+                "supervisor_user_id": "@hermes-supervisor:example.org",
+                "allowed_rooms": ["!room:example.org"],
+                "session_scope": "room",
+                "auto_thread": False,
             },
-        },
-    }))
-    adapter = MatrixAdapter(PlatformConfig(
-        enabled=True, token="tok", extra={
-            "homeserver": "https://matrix.example.org", "user_id": "@hermes:example.org",
-            "factory_project_catalog_path": str(catalog), "allowed_rooms": ["!ordinary:example.org"],
-            "session_scope": "room", "auto_thread": False,
-        },
-    ))
+        )
+    )
     adapter._allowed_user_ids = {"@alice:example.org"}
-    adapter._dm_rooms["!factory:example.org"] = False
-    adapter._dm_rooms["!ordinary:example.org"] = False
-    adapter._resolve_room_identity = AsyncMock(return_value=SimpleNamespace(display_name="factory", room_topic="", server_name="", chat_type="group"))
+    adapter._resolve_room_identity = AsyncMock(
+        return_value=SimpleNamespace(
+            display_name="room",
+            room_topic="",
+            server_name="example.org",
+            chat_type="group",
+            joined_member_ids=joined_member_ids,
+        )
+    )
     adapter._get_display_name = AsyncMock(return_value="Alice")
     adapter._background_read_receipt = MagicMock()
 
-    factory = await adapter._resolve_message_context(
-        "!factory:example.org", "@alice:example.org", "$factory", "please continue", {"body": "please continue"}, {},
+    context = await adapter._resolve_message_context(
+        "!room:example.org",
+        "@alice:example.org",
+        "$event",
+        "please continue",
+        {"body": "please continue"},
+        {},
     )
-    ordinary = await adapter._resolve_message_context(
-        "!ordinary:example.org", "@alice:example.org", "$ordinary", "please continue", {"body": "please continue"}, {},
+    assert (context is not None) is admitted
+
+
+@pytest.mark.asyncio
+async def test_explicit_hermes_mention_is_admitted_in_supervisor_room(tmp_path):
+    adapter = _make_adapter(tmp_path)
+    adapter._supervisor_user_id = "@hermes-supervisor:example.org"
+    adapter._allowed_rooms = {"!supervisor:example.org"}
+    adapter._resolve_room_identity = AsyncMock(
+        return_value=SimpleNamespace(
+            display_name="Hermes Supervisor",
+            room_topic="",
+            server_name="example.org",
+            chat_type="group",
+            joined_member_ids=frozenset(
+                {
+                    "@hermes:example.org",
+                    "@hermes-supervisor:example.org",
+                    "@alice:example.org",
+                }
+            ),
+        )
     )
-    assert factory is not None and factory[-1].thread_id is None
-    assert ordinary is None
+    adapter._get_display_name = AsyncMock(return_value="Alice")
+    adapter._background_read_receipt = MagicMock()
 
-    payload = json.loads((catalog / "hindsight.json").read_text())
-    payload["lifecycle"] = "archived"
-    (catalog / "hindsight.json").write_text(json.dumps(payload))
-    assert await adapter._resolve_message_context(
-        "!factory:example.org", "@alice:example.org", "$archived", "please continue", {"body": "please continue"}, {},
-    ) is None
+    context = await adapter._resolve_message_context(
+        "!supervisor:example.org",
+        "@alice:example.org",
+        "$mentioned",
+        "Hermes, please continue",
+        {
+            "body": "Hermes, please continue",
+            "m.mentions": {"user_ids": ["@hermes:example.org"]},
+        },
+        {},
+    )
 
-    payload["lifecycle"] = "active"
-    payload.pop("matrix_membership")
-    (catalog / "hindsight.json").write_text(json.dumps(payload))
-    assert await adapter._resolve_message_context(
-        "!factory:example.org", "@alice:example.org", "$unverified", "please continue", {"body": "please continue"}, {},
-    ) is None
+    assert context is not None
+
+
+@pytest.mark.asyncio
+async def test_room_identity_caches_joined_member_ids(tmp_path):
+    adapter = _make_adapter(tmp_path)
+    get_members = AsyncMock(
+        return_value={
+            "@hermes:example.org": object(),
+            "@alice:example.org": object(),
+        }
+    )
+    adapter._client = SimpleNamespace(
+        state_store=SimpleNamespace(get_members=get_members),
+        get_state_event=AsyncMock(return_value={}),
+    )
+
+    identity = await adapter._resolve_room_identity("!room:example.org")
+
+    assert identity.joined_member_ids == frozenset(
+        {"@hermes:example.org", "@alice:example.org"}
+    )
+    assert identity.joined_member_count == 2
+    from plugins.platforms.matrix.adapter import Membership
+
+    get_members.assert_awaited_with(
+        "!room:example.org",
+        memberships=(Membership.JOIN,),
+    )
+
+
+@pytest.mark.asyncio
+async def test_joined_members_fall_back_when_state_cache_is_incomplete(tmp_path):
+    adapter = _make_adapter(tmp_path)
+    get_members = AsyncMock(return_value=["@stale-invite:example.org"])
+    get_joined_members = AsyncMock(
+        return_value={
+            "@hermes:example.org": object(),
+            "@hermes-supervisor:example.org": object(),
+        }
+    )
+    adapter._client = SimpleNamespace(
+        state_store=SimpleNamespace(
+            has_full_member_list=AsyncMock(return_value=False),
+            get_members=get_members,
+        ),
+        get_joined_members=get_joined_members,
+    )
+
+    member_ids = await adapter._get_room_joined_member_ids(
+        "!supervisor:example.org"
+    )
+
+    assert member_ids == frozenset(
+        {"@hermes:example.org", "@hermes-supervisor:example.org"}
+    )
+    get_members.assert_not_awaited()
+    get_joined_members.assert_awaited_once_with("!supervisor:example.org")
 
 
 def _make_event(
@@ -394,6 +502,22 @@ async def test_dm_mention_thread_creates_thread(monkeypatch):
 
 
 class TestMatrixConfigBridge:
+    def test_supervisor_identity_yaml_bridge(self, monkeypatch):
+        from plugins.platforms.matrix.adapter import _apply_yaml_config
+
+        monkeypatch.delenv("MATRIX_SUPERVISOR_USER_ID", raising=False)
+        _apply_yaml_config(
+            {},
+            {"supervisor_user_id": "@hermes-supervisor:example.org"},
+        )
+
+        import os
+
+        assert (
+            os.getenv("MATRIX_SUPERVISOR_USER_ID")
+            == "@hermes-supervisor:example.org"
+        )
+
     def test_yaml_bridge_sets_env_vars(self, monkeypatch, tmp_path):
         """Matrix YAML config should bridge to env vars."""
         monkeypatch.delenv("MATRIX_REQUIRE_MENTION", raising=False)
