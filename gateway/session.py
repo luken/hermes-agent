@@ -185,6 +185,13 @@ class SessionSource:
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
     profile_route_rejected: bool = field(default=False, repr=False, compare=False)
+    # Trusted adapter-local factory-project binding. These values are derived
+    # from a controller-owned catalog record at ingress and deliberately never
+    # cross relay/session serialization boundaries.
+    runtime_cwd: Optional[str] = field(default=None, repr=False, compare=False)
+    factory_project_context: Optional[Dict[str, Any]] = field(
+        default=None, repr=False, compare=False
+    )
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
