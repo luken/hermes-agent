@@ -31,7 +31,7 @@ Do not use it for a separate downstream review card. A downstream card is ordina
 ## Prerequisites
 
 - A Kanban worker context with the current task and run identifiers.
-- Native Kanban tools: `kanban_show`, `kanban_comment`, `kanban_complete`, `kanban_request_changes`, and `kanban_block`.
+- Native Kanban tools: `kanban_show`, `kanban_comment`, `kanban_complete`, `kanban_request_changes`, `kanban_review_pass`, and `kanban_block`.
 - Workspace access through `read_file`, `search_files`, and `terminal` when the deliverable is code.
 - The task's original specification, acceptance criteria, handoff summary, and prior run history must be available through `kanban_show`.
 
@@ -50,6 +50,7 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 |---|---|---|
 | Approve | Acceptance criteria and verification pass | `kanban_complete` |
 | Request changes | Correctable implementation defects remain | `kanban_comment`, then `kanban_request_changes` |
+| Pass patch review | No blocker remains and the implementation card has more patches | `kanban_review_pass` |
 | Escalate | A human decision or external prerequisite is required | `kanban_block` |
 
 A requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, the persisted reviewer provenance routes the re-review back to the same reviewer profile.
