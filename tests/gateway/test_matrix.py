@@ -2382,7 +2382,7 @@ class TestMatrixFreeResponsePolicy:
         self.adapter._background_read_receipt = MagicMock()
 
     @pytest.mark.asyncio
-    async def test_free_response_room_allows_unmentioned_message(self):
+    async def test_legacy_free_response_room_still_requires_mention(self):
         ctx = await self.adapter._resolve_message_context(
             room_id="!free:example.org",
             sender="@alice:example.org",
@@ -2392,7 +2392,7 @@ class TestMatrixFreeResponsePolicy:
             relates_to={},
         )
 
-        assert ctx is not None
+        assert ctx is None
 
 
 class TestMatrixClockSkewWarning:

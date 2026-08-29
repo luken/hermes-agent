@@ -113,6 +113,32 @@ def _render(context, redact_pii=False):
     return build_session_context_prompt(context, redact_pii=redact_pii)
 
 
+def test_factory_project_snapshot_refreshes_only_the_turn_sidecar():
+    runner = _make_runner()
+    context = _make_context(platform=Platform.MATRIX, chat_id="!factory:example.org")
+    source = context.source
+    source.runtime_cwd = "/hermes/projects/demo"
+    source.factory_project_context = {
+        "slug": "demo",
+        "lifecycle": "active",
+        "latest_receipt": {"state": "applied"},
+    }
+    prompt_before = runner._pinned_session_context_prompt(context, False, "factory")
+    note_before = runner._factory_project_sidecar_note(source)
+
+    source.factory_project_context = {
+        "slug": "demo",
+        "lifecycle": "active",
+        "latest_receipt": {"state": "verified"},
+    }
+    prompt_after = runner._pinned_session_context_prompt(context, False, "factory")
+    note_after = runner._factory_project_sidecar_note(source)
+
+    assert prompt_after == prompt_before
+    assert note_after != note_before
+    assert '"state":"verified"' in note_after
+
+
 # ---------------------------------------------------------------------------
 # 1. Parity: key <-> render (the maintained invariant)
 # ---------------------------------------------------------------------------

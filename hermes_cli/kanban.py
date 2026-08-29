@@ -689,6 +689,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "reason", nargs="+", help="Concrete changes required before re-review",
     )
 
+    p_review_pass = sub.add_parser(
+        "review-pass",
+        help="Clean patch review: return the active review run to its implementer",
+    )
+    p_review_pass.add_argument("task_id")
+    p_review_pass.add_argument(
+        "summary", nargs="+", help="Clean review result and reviewed evidence",
+    )
+
     p_reopen_review = sub.add_parser(
         "reopen-review",
         help="Send one or more review tasks back for changes (review -> ready/todo)",
@@ -1132,6 +1141,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
+            "review-pass": _cmd_review_pass,
             "reopen-review":  _cmd_reopen_review,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
@@ -2492,6 +2502,29 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_review_pass(args: argparse.Namespace) -> int:
+    tid = args.task_id
+    summary = " ".join(args.summary).strip()
+    with kb.connect_closing() as conn:
+        ok, detail = kb.pass_review(
+            conn,
+            tid,
+            summary=summary,
+            expected_run_id=_worker_run_id_for(tid),
+        )
+        if not ok:
+            print(
+                f"cannot pass review for {tid}: {detail or 'invalid review state'}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"Passed review for {tid}"
+            + (f"; routed to {detail}" if detail else "")
+        )
+    return 0
+
+
 def _cmd_reopen_review(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     if not ids:
@@ -3350,7 +3383,7 @@ Common subcommands:
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
-  `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
+  `request-review <id>` Enter first-class review; `request-changes <id> <reason>` or `review-pass <id> <summary>` returns an active review to its implementer
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards

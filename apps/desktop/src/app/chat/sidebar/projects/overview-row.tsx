@@ -128,11 +128,11 @@ export function ProjectOverviewRow({
       data-glass-opaque={dragging ? '' : undefined}
       label={
         <SidebarRowLink
-          aria-label={s.projects.enter(project.label)}
+          aria-label={project.factorySlug ? `${s.projects.enter(project.label)}; factory project ${project.factorySlug}, Matrix room ${project.matrixRoomId || 'unlinked'}` : s.projects.enter(project.label)}
           labelClassName={cn('hover:text-foreground hover:underline', isActive && 'text-foreground')}
           onClick={() => onEnter?.(project.id)}
         >
-          {project.label}
+          {project.label}{project.factorySlug ? <span className="ml-1 text-[10px] text-(--ui-text-tertiary)">factory</span> : null}
         </SidebarRowLink>
       }
       lead={lead}

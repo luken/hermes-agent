@@ -1021,6 +1021,54 @@ def _handle_request_changes(args: dict, **kw) -> str:
         return tool_error(f"kanban_request_changes: {e}")
 
 
+def _handle_review_pass(args: dict, **kw) -> str:
+    """Return a reviewer-owned task to its implementer without completing it."""
+    delegated_err = _reject_delegated_child_mutation("kanban_review_pass")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    summary = args.get("summary")
+    if not summary or not str(summary).strip():
+        return tool_error("summary is required — record the clean review verdict")
+    summary = redact_sensitive_text(str(summary), force=True)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok, detail = kb.pass_review(
+                conn,
+                tid,
+                summary=summary,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not pass review for {tid}: {detail or 'invalid review state'}"
+                )
+            landed = kb.get_task(conn, tid)
+            run = kb.latest_run(conn, tid)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                status=landed.status if landed else "ready",
+                implementer=detail,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_review_pass: {e}")
+    except Exception as e:
+        logger.exception("kanban_review_pass failed")
+        return tool_error(f"kanban_review_pass: {e}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1977,6 +2025,35 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
     },
 }
 
+KANBAN_REVIEW_PASS_SCHEMA = {
+    "name": "kanban_review_pass",
+    "description": (
+        "Reviewer verdict: record a clean review and return the current card "
+        "to its original implementer without completing it. Use for an "
+        "intra-series patch review with no blockers; final package review "
+        "still uses kanban_complete. Only valid from a task claimed from the "
+        "review column."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "Concise clean-review result, including the reviewed base, "
+                    "head, and applicable evidence."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["summary"],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -2405,6 +2482,15 @@ registry.register(
     handler=_handle_request_changes,
     check_fn=_check_kanban_mode,
     emoji="↩",
+)
+
+registry.register(
+    name="kanban_review_pass",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_PASS_SCHEMA,
+    handler=_handle_review_pass,
+    check_fn=_check_kanban_mode,
+    emoji="✓",
 )
 
 registry.register(

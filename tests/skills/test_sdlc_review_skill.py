@@ -29,6 +29,7 @@ REVIEW_ACTIONS = {
     "kanban_comment",
     "kanban_complete",
     "kanban_request_changes",
+    "kanban_review_pass",
     "kanban_block",
 }
 
