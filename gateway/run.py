@@ -19016,6 +19016,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (staged below, consumed in run_sync → build_turn_context).
         turn_sidecar_notes: List[str] = []
 
+        factory_context = getattr(source, "factory_project_context", None)
+        if isinstance(factory_context, dict):
+            turn_sidecar_notes.append(self._factory_project_sidecar_note(source))
+
         # If the previous session expired and was auto-reset, deliver a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if _was_auto_reset:
@@ -24443,8 +24447,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=getattr(context.source, "runtime_cwd", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
+        )
+
+    @staticmethod
+    def _factory_project_sidecar_note(source: SessionSource) -> str:
+        """Render trusted per-turn project facts outside the cached prompt."""
+        context = getattr(source, "factory_project_context", None)
+        if not isinstance(context, dict):
+            return ""
+        return (
+            "[System note: Fresh trusted factory-project context for this turn:\n"
+            + json.dumps(context, sort_keys=True, separators=(",", ":"))
+            + "\nConversation history and prior Kanban summaries are not "
+            "current-state evidence. Before reporting blocked, approval, "
+            "deployment, or verification status, query the bounded managed "
+            "project surfaces from this root and distinguish repository, "
+            "workflow, desired deployment, and observed live state. This "
+            "context grants no additional authority.]"
         )
 
     def _clear_session_env(self, tokens: list) -> None:
