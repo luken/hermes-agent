@@ -2,7 +2,7 @@ name: Omner native OIDC image
 
 on:
   push:
-    branches: [codex/matrix-supervisor-identity-gate]
+    branches: [codex/hermes-status-convergence-production]
   workflow_dispatch:
 
 permissions:
@@ -29,6 +29,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Verify every changed runtime file enters the deployment image
+        run: |
+          BASE_REVISION="$(sed -n 's/^LABEL org.opencontainers.image.base.revision="\([0-9a-f]\{40\}\)"$/\1/p' docker/omner-native-oidc.Dockerfile)"
+          test -n "${BASE_REVISION}"
+          git fetch --no-tags --depth=1 origin "${BASE_REVISION}"
+          python scripts/check_omner_runtime_overlay.py \
+            --base "${BASE_REVISION}" \
+            --dockerfile docker/omner-native-oidc.Dockerfile
+
       - name: Build and publish reviewed amd64 deployment image
         id: image
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
@@ -37,7 +46,7 @@ jobs:
           file: docker/omner-native-oidc.Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/luken/hermes-agent:omner-matrix-supervisor-gate-v2026.8.19-r1
+          tags: ghcr.io/luken/hermes-agent:omner-status-convergence-v2026.8.29-r1
           sbom: true
           provenance: mode=max
           build-args: |
@@ -76,7 +85,7 @@ jobs:
           DIGEST: ${{ steps.image.outputs.digest }}
         run: |
           cosign verify \
-            --certificate-identity 'https://github.com/luken/hermes-agent/.github/workflows/omner-native-oidc-image.yml@refs/heads/codex/matrix-supervisor-identity-gate' \
+            --certificate-identity 'https://github.com/luken/hermes-agent/.github/workflows/omner-native-oidc-image.yml@refs/heads/codex/hermes-status-convergence-production' \
             --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
             "ghcr.io/luken/hermes-agent@${DIGEST}"
           echo "ghcr.io/luken/hermes-agent@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
