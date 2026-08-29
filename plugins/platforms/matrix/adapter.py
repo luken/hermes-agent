@@ -20,6 +20,8 @@ Environment variables:
     MATRIX_REACTIONS        Set "false" to disable processing lifecycle reactions
                             (eyes/checkmark/cross). Default: true
     MATRIX_REQUIRE_MENTION      Require @mention in rooms (default: true)
+    MATRIX_SUPERVISOR_USER_ID   When set, require a production-Hermes mention
+                                only in rooms where this peer and Hermes are joined
     MATRIX_FREE_RESPONSE_ROOMS  Comma-separated room IDs exempt from mention requirement
                                 (alias of matrix.free_response_rooms)
     MATRIX_ALLOWED_ROOMS    Comma-separated room IDs; if set, bot ONLY responds
@@ -78,6 +80,7 @@ try:
         ContentURI,
         EventID,
         EventType,
+        Membership,
         PaginationDirection,
         PresenceState,
         RoomCreatePreset,
@@ -100,6 +103,11 @@ except ImportError:
         ROOM_NAME = "m.room.name"
 
     EventType = _EventTypeStub  # type: ignore[misc,assignment]
+
+    class _MembershipStub:  # type: ignore[no-redef]
+        JOIN = "join"
+
+    Membership = _MembershipStub  # type: ignore[misc,assignment]
 
     class _PaginationDirectionStub:  # type: ignore[no-redef]
         BACKWARD = "b"
@@ -501,6 +509,7 @@ class MatrixRoomIdentity:
     canonical_alias: str | None
     server_name: str | None
     joined_member_count: int | None
+    joined_member_ids: frozenset[str] | None
     is_direct_account_data: bool
     display_name: str
     has_explicit_name: bool
@@ -1263,6 +1272,10 @@ class MatrixAdapter(BasePlatformAdapter):
         # Mention/thread gating — parsed once from config.extra or env vars.
         self._require_mention: bool = self._parse_require_mention(config)
         self._thread_require_mention: bool = self._parse_thread_require_mention(config)
+        supervisor_user_id = config.extra.get("supervisor_user_id")
+        if supervisor_user_id is None:
+            supervisor_user_id = os.getenv("MATRIX_SUPERVISOR_USER_ID", "")
+        self._supervisor_user_id = str(supervisor_user_id or "").strip()
         free_rooms_raw = config.extra.get("free_response_rooms")
         if free_rooms_raw is None:
             free_rooms_raw = os.getenv("MATRIX_FREE_RESPONSE_ROOMS", "")
@@ -3442,6 +3455,34 @@ class MatrixAdapter(BasePlatformAdapter):
         )
         is_mentioned = self._is_bot_mentioned(body, formatted_body, mention_user_ids)
 
+        identity_policy_enabled = bool(self._supervisor_user_id)
+        joined_member_ids = getattr(identity, "joined_member_ids", None)
+        identity_requires_mention = bool(
+            identity_policy_enabled
+            and (
+                joined_member_ids is None
+                or {
+                    self._user_id,
+                    self._supervisor_user_id,
+                }.issubset(joined_member_ids)
+            )
+        )
+        is_command = body.startswith("/")
+
+        # A configured peer-identity policy is stricter than sticky thread
+        # participation: when both Hermes identities share a room, an explicit
+        # production-Hermes mention is required on every ordinary turn.
+        # Unresolved membership fails closed to the same behavior.
+        if identity_requires_mention and not is_mentioned and not is_command:
+            logger.debug(
+                "Matrix: ignoring message %s in %s — production Hermes and "
+                "Supervisor share the room, or membership is unresolved, "
+                "and no production-Hermes @mention was present",
+                event_id,
+                room_id,
+            )
+            return None
+
         # Require-mention gating.
         if not is_dm:
             # allowed_rooms check (whitelist — must pass before other gating).
@@ -3457,13 +3498,22 @@ class MatrixAdapter(BasePlatformAdapter):
                 )
                 return None
 
-            # Matrix is globally mention-gated.  Unlike other platforms, the
-            # legacy free_response_rooms list cannot elevate a room: only a
-            # verified active factory catalog record may do that.
-            is_free_room = is_factory_room
+            # With a configured Supervisor identity, authenticated joined
+            # membership is the sole mention-policy authority. Factory catalog
+            # state remains an admission/routing authority only. Without that
+            # configuration, retain the legacy catalog-scoped behavior.
+            is_free_room = (
+                not identity_requires_mention
+                if identity_policy_enabled
+                else is_factory_room
+            )
             in_bot_thread = bool(thread_id and thread_id in self._threads)
-            is_command = body.startswith("/")
-            if self._require_mention and not is_free_room and not in_bot_thread:
+            if (
+                not identity_policy_enabled
+                and self._require_mention
+                and not is_free_room
+                and not in_bot_thread
+            ):
                 if not is_mentioned and not is_command:
                     logger.debug(
                         "Matrix: ignoring message %s in %s — no @mention "
@@ -3477,8 +3527,12 @@ class MatrixAdapter(BasePlatformAdapter):
             # require @mention when thread_require_mention is enabled.
             # Prevents infinite reply loops in multi-agent shared rooms
             # where multiple bots all participate in the same thread.
-            elif (self._thread_require_mention and in_bot_thread
-                  and not is_free_room):
+            elif (
+                not identity_policy_enabled
+                and self._thread_require_mention
+                and in_bot_thread
+                and not is_free_room
+            ):
                 if not is_mentioned:
                     logger.debug(
                         "Matrix: ignoring message %s in thread %s — "
@@ -4664,19 +4718,80 @@ class MatrixAdapter(BasePlatformAdapter):
         )
         if state_store:
             try:
-                members = await state_store.get_members(room_id)
-                if members is not None:
-                    return len(members)
+                has_full_member_list = getattr(
+                    state_store,
+                    "has_full_member_list",
+                    None,
+                )
+                cache_complete = (
+                    await has_full_member_list(room_id)
+                    if inspect.iscoroutinefunction(has_full_member_list)
+                    else True
+                )
+                if cache_complete:
+                    members = await state_store.get_members(
+                        room_id,
+                        memberships=(Membership.JOIN,),
+                    )
+                    if members is not None:
+                        return len(members)
             except Exception:
                 pass
 
         # Tier 2: API fallback (direct server query) when the cache is empty.
         client = getattr(self, "_client", None)
-        if client is not None and hasattr(client, "joined_members"):
+        if client is not None and hasattr(client, "get_joined_members"):
             try:
-                resp = await client.joined_members(room_id)
-                if getattr(resp, "members", None) is not None:
-                    return len(resp.members)
+                members = await client.get_joined_members(room_id)
+                if members is not None:
+                    return len(members)
+            except Exception:
+                pass
+
+        return None
+
+    async def _get_room_joined_member_ids(
+        self,
+        room_id: str,
+    ) -> Optional[frozenset[str]]:
+        """Return authenticated joined member IDs, or ``None`` if unresolved."""
+        state_store = (
+            getattr(self._client, "state_store", None) if self._client else None
+        )
+        if state_store:
+            try:
+                has_full_member_list = getattr(
+                    state_store,
+                    "has_full_member_list",
+                    None,
+                )
+                cache_complete = (
+                    await has_full_member_list(room_id)
+                    if inspect.iscoroutinefunction(has_full_member_list)
+                    else True
+                )
+                if cache_complete:
+                    members = await state_store.get_members(
+                        room_id,
+                        memberships=(Membership.JOIN,),
+                    )
+                    if members is not None:
+                        member_ids = (
+                            members.keys() if isinstance(members, dict) else members
+                        )
+                        return frozenset(str(user_id) for user_id in member_ids)
+            except Exception:
+                pass
+
+        client = getattr(self, "_client", None)
+        if client is not None and hasattr(client, "get_joined_members"):
+            try:
+                members = await client.get_joined_members(room_id)
+                if members is not None:
+                    member_ids = (
+                        members.keys() if isinstance(members, dict) else members
+                    )
+                    return frozenset(str(user_id) for user_id in member_ids)
             except Exception:
                 pass
 
@@ -4764,6 +4879,7 @@ class MatrixAdapter(BasePlatformAdapter):
         room_name = await self._get_room_name(room_id)
         room_topic = await self._get_room_topic(room_id)
         canonical_alias = await self._get_room_canonical_alias(room_id)
+        joined_member_ids = await self._get_room_joined_member_ids(room_id)
         member_count = await self._get_room_member_count(room_id)
         has_explicit_name = bool(room_name)
         is_direct = bool(self._dm_rooms.get(room_id, False))
@@ -4793,6 +4909,7 @@ class MatrixAdapter(BasePlatformAdapter):
             canonical_alias=canonical_alias,
             server_name=self._room_server_name(room_id),
             joined_member_count=member_count,
+            joined_member_ids=joined_member_ids,
             is_direct_account_data=is_direct,
             display_name=display_name,
             has_explicit_name=has_explicit_name,
@@ -5450,6 +5567,9 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
     """
     if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
         os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
+    supervisor_user_id = matrix_cfg.get("supervisor_user_id")
+    if supervisor_user_id is not None and not os.getenv("MATRIX_SUPERVISOR_USER_ID"):
+        os.environ["MATRIX_SUPERVISOR_USER_ID"] = str(supervisor_user_id)
     au = matrix_cfg.get("allowed_users")
     if au is not None and not os.getenv("MATRIX_ALLOWED_USERS"):
         if isinstance(au, list):
