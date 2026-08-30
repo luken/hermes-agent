@@ -9,6 +9,28 @@ from hermes_cli.kanban_swarm import (
 )
 
 
+@pytest.fixture(autouse=True)
+def swarm_profile_skills(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Give the swarm's built-in forced skills real isolated profiles.
+
+    Swarm creation is an admission path, so the verifier and synthesizer must
+    satisfy the same profile-skill contract as an ordinary Kanban task.  Keep
+    these graph tests hermetic while exercising that production validation.
+    """
+    home = tmp_path / ".hermes"
+    for profile, skill in (
+        ("reviewer", "requesting-code-review"),
+        ("writer", "humanizer"),
+    ):
+        skill_dir = home / "profiles" / profile / "skills" / skill
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {skill}\ndescription: test skill\n---\nUse it.\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+
 def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):
     conn = kb.connect(tmp_path / "kanban.db")
     try:
