@@ -8072,7 +8072,13 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    start_point: Optional[str] = None,
+) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
@@ -8086,7 +8092,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     else:
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), start_point or "HEAD",
         ]
     result = subprocess.run(
         cmd,
@@ -8103,7 +8109,10 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    start_point: Optional[str] = None,
 ) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``.
 
@@ -8142,7 +8151,9 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(
+            repo_root, target, branch_name, start_point=start_point
+        )
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -8168,7 +8179,10 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(
+                    fallback_root, fallback, branch_name,
+                    start_point=start_point,
+                )
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
@@ -8178,7 +8192,9 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(
+            repo_root, target, branch_name, start_point=start_point
+        )
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -8187,8 +8203,48 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(
+        repo_root, requested, branch_name, start_point=start_point
+    )
     return requested, branch_name
+
+
+def _parent_handoff_start_point(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[str]:
+    """Return one done parent's machine-proven Git head for a fresh child.
+
+    Dependency graphs are commonly created before a Builder finishes. A
+    child's branch therefore must not be based on the repository's ambient
+    ``HEAD`` at graph-creation time. At dispatch, seed a *new* child branch
+    from its sole done parent's structured handoff. Existing branches are
+    deliberately never moved by this helper or by :func:`_ensure_git_worktree`.
+    """
+    rows = conn.execute(
+        "SELECT t.id, t.status FROM task_links l "
+        "JOIN tasks t ON t.id = l.parent_id "
+        "WHERE l.child_id = ? ORDER BY t.id",
+        (task_id,),
+    ).fetchall()
+    if len(rows) != 1 or rows[0]["status"] != "done":
+        return None
+    run = latest_run(conn, rows[0]["id"])
+    metadata = (
+        run.metadata
+        if run is not None and isinstance(run.metadata, dict)
+        else {}
+    )
+    gate = metadata.get("handoff_gate")
+    candidates = [
+        gate.get("head_commit") if isinstance(gate, dict) else None,
+        metadata.get("exact_head"),
+        metadata.get("head_commit"),
+    ]
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if re.fullmatch(r"[0-9a-fA-F]{40}", value):
+            return value.lower()
+    return None
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
@@ -10597,7 +10653,11 @@ def _dispatch_once_locked(
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                workspace, resolved_branch_name = _resolve_worktree_workspace(
+                    claimed,
+                    board=board,
+                    start_point=_parent_handoff_start_point(conn, claimed.id),
+                )
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -10724,7 +10784,11 @@ def _dispatch_once_locked(
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                workspace, resolved_branch_name = _resolve_worktree_workspace(
+                    claimed,
+                    board=board,
+                    start_point=_parent_handoff_start_point(conn, claimed.id),
+                )
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
