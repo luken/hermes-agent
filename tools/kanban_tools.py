@@ -31,6 +31,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
+import subprocess
+import time
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -47,6 +50,168 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+
+_HANDOFF_OUTPUT_LIMIT = 500
+_NON_CODE_SUFFIXES = {
+    ".md", ".mdx", ".rst", ".txt", ".adoc", ".png", ".jpg", ".jpeg",
+    ".gif", ".svg", ".webp", ".pdf",
+}
+
+
+def _git_result(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+
+def _is_non_code_handoff_path(path: str) -> bool:
+    item = Path(path)
+    return (
+        item.suffix.lower() in _NON_CODE_SUFFIXES
+        or bool(item.parts and item.parts[0] in {"docs", "documentation"})
+    )
+
+
+def _machine_handoff_gate(
+    task: Any,
+    metadata: Optional[dict],
+    *,
+    transition: str,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Prove a clean, committed, ancestry-bounded Git handoff.
+
+    This runs only for dispatcher-owned worktree tasks. Human/orchestrator
+    transitions keep their existing override surface, and non-Git work is not
+    forced through a code-specific gate.
+    """
+    if not task or os.environ.get("HERMES_KANBAN_TASK") != task.id:
+        return {"applicable": False, "reason": "operator_transition"}, None
+    if task.workspace_kind != "worktree":
+        return {"applicable": False, "reason": "non_worktree"}, None
+    workspace = str(task.workspace_path or os.environ.get("HERMES_KANBAN_WORKSPACE") or "")
+    if not workspace:
+        return None, "worktree handoff has no workspace path"
+    cwd = Path(workspace)
+    if not cwd.is_dir():
+        return None, "worktree handoff workspace is unavailable"
+
+    root_result = _git_result(cwd, "rev-parse", "--show-toplevel")
+    if root_result.returncode != 0:
+        return None, "worktree handoff workspace is not a Git checkout"
+    root = Path(root_result.stdout.strip())
+    status = _git_result(root, "status", "--porcelain=v1", "--untracked-files=all")
+    if status.returncode != 0:
+        return None, "could not inspect worktree cleanliness"
+    if status.stdout.strip():
+        return None, "worktree is dirty; commit or remove all changes before handoff"
+
+    head_result = _git_result(root, "rev-parse", "--verify", "HEAD^{commit}")
+    if head_result.returncode != 0:
+        return None, "worktree has no verifiable HEAD commit"
+    head = head_result.stdout.strip()
+
+    supplied_handoff = metadata.get("handoff") if isinstance(metadata, dict) else None
+    supplied_base = (
+        str(supplied_handoff.get("base_commit") or "").strip()
+        if isinstance(supplied_handoff, dict) else ""
+    )
+    supplied_head = (
+        str(supplied_handoff.get("head_commit") or "").strip()
+        if isinstance(supplied_handoff, dict) else ""
+    )
+    if supplied_head:
+        expected_head = _git_result(
+            root, "rev-parse", "--verify", f"{supplied_head}^{{commit}}"
+        )
+        if expected_head.returncode != 0:
+            return None, "declared handoff head is not a verifiable commit"
+        if expected_head.stdout.strip() != head:
+            return None, "declared handoff head does not match worktree HEAD"
+    base = ""
+    base_source = ""
+    # A worker-supplied base is a claim about the exact review boundary, not a
+    # hint.  Resolve and retain that commit verbatim so a non-ancestor cannot
+    # silently collapse to an older merge-base and widen the reviewed patch.
+    if supplied_base:
+        resolved = _git_result(
+            root, "rev-parse", "--verify", f"{supplied_base}^{{commit}}"
+        )
+        if resolved.returncode != 0:
+            return None, "declared patch base is not a verifiable commit"
+        base = resolved.stdout.strip()
+        base_source = "declared"
+
+    candidates = [] if supplied_base else [
+        "@{upstream}", "origin/main", "origin/master", "main", "master"
+    ]
+    for candidate in candidates:
+        resolved = _git_result(root, "rev-parse", "--verify", f"{candidate}^{{commit}}")
+        if resolved.returncode != 0:
+            continue
+        merge_base = _git_result(root, "merge-base", head, resolved.stdout.strip())
+        if merge_base.returncode == 0 and merge_base.stdout.strip():
+            base = merge_base.stdout.strip()
+            base_source = candidate
+            break
+    if not base:
+        return None, (
+            "could not determine a patch base; pass "
+            "metadata.handoff.base_commit or configure a main-branch ref"
+        )
+    ancestor = _git_result(root, "merge-base", "--is-ancestor", base, head)
+    if ancestor.returncode != 0:
+        return None, "declared patch base is not an ancestor of HEAD"
+    diff_check = _git_result(root, "diff", "--check", f"{base}..{head}")
+    if diff_check.returncode != 0:
+        detail = (diff_check.stdout or diff_check.stderr).strip()[:_HANDOFF_OUTPUT_LIMIT]
+        return None, f"git diff --check failed: {detail or 'invalid patch'}"
+    changed_result = _git_result(root, "diff", "--name-only", "-z", f"{base}..{head}")
+    if changed_result.returncode != 0:
+        return None, "could not enumerate committed handoff files"
+    changed = sorted(path for path in changed_result.stdout.split("\0") if path)
+    if transition == "review" and not changed:
+        return None, "review handoff contains no committed changes"
+
+    from agent.verification_evidence import verification_status
+
+    verification = verification_status(
+        session_id=os.environ.get("HERMES_SESSION_ID"), cwd=root
+    )
+    code_changed = any(not _is_non_code_handoff_path(path) for path in changed)
+    current_edits = bool(verification.get("changed_paths"))
+    if (code_changed or current_edits) and verification.get("status") != "passed":
+        return None, (
+            "code handoff has no fresh passing verification evidence for this "
+            f"worker session (status={verification.get('status')})"
+        )
+    evidence = verification.get("evidence") or {}
+    receipt = {
+        "schema": "hermes.machine-handoff/v1",
+        "applicable": True,
+        "transition": transition,
+        "base_commit": base,
+        "base_source": base_source,
+        "head_commit": head,
+        "clean": True,
+        "diff_check": "passed",
+        "changed_files": changed[:200],
+        "changed_files_truncated": len(changed) > 200,
+        "code_changed": code_changed,
+        "verification": {
+            "status": verification.get("status"),
+            "command": evidence.get("canonical_command"),
+            "kind": evidence.get("kind"),
+            "scope": evidence.get("scope"),
+            "exit_code": evidence.get("exit_code"),
+        },
+        "checked_at": int(time.time()),
+    }
+    return receipt, None
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -765,6 +930,17 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and keep this task alive."
                 )
 
+            handoff_receipt, handoff_error = _machine_handoff_gate(
+                task, metadata, transition="complete"
+            )
+            if handoff_error is not None:
+                return tool_error(
+                    f"kanban_complete handoff gate rejected the transition: "
+                    f"{handoff_error}. The task remains in-flight."
+                )
+            metadata = dict(metadata or {})
+            metadata["handoff_gate"] = handoff_receipt
+
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -944,6 +1120,16 @@ def _handle_request_review(args: dict, **kw) -> str:
                     "Provide acceptance evidence matching the card before "
                     "requesting review."
                 )
+            handoff_receipt, handoff_error = _machine_handoff_gate(
+                task, metadata, transition="review"
+            )
+            if handoff_error is not None:
+                return tool_error(
+                    f"kanban_request_review handoff gate rejected the transition: "
+                    f"{handoff_error}. The task remains in-flight."
+                )
+            metadata = dict(metadata or {})
+            metadata["handoff_gate"] = handoff_receipt
             ok, fail_reason = kb.request_review(
                 conn, tid,
                 summary=summary,
@@ -1011,6 +1197,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 run_id=run.id if run else None,
                 status=landed.status if landed else "ready",
                 implementer=detail,
+                supervisor_attention=bool(landed and landed.status == "triage"),
             )
         finally:
             conn.close()
@@ -1848,8 +2035,13 @@ KANBAN_COMPLETE_SCHEMA = {
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "\"findings\": [...]}. For a dispatcher-owned Git "
+                    "worktree, include handoff.base_commit and optionally "
+                    "handoff.head_commit when a specific "
+                    "review boundary is required; the kernel records its own "
+                    "cleanliness, HEAD, ancestry, diff-check, changed-file, "
+                    "and verification receipt. Surfaced to downstream workers "
+                    "alongside ``summary``."
                 ),
             },
             "result": {
@@ -1986,7 +2178,13 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
                 "type": "object",
                 "description": (
                     "Optional structured handoff facts for the reviewer, such "
-                    "as changed_files, tests_run, commit, or decisions."
+                    "as changed_files, tests_run, commit, or decisions. For a "
+                    "dispatcher-owned Git worktree, pass "
+                    "{\"handoff\": {\"base_commit\": \"<commit>\", "
+                    "\"head_commit\": \"<commit>\"}} when an "
+                    "exact review boundary is required; the kernel independently "
+                    "verifies and records the base, HEAD, clean worktree, diff "
+                    "check, changed files, and fresh test evidence."
                 ),
                 "additionalProperties": True,
             },

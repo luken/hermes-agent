@@ -31,6 +31,7 @@ COPY --chown=root:root --chmod=0644 agent/kanban_stop.py /opt/hermes/agent/kanba
 COPY --chown=root:root --chmod=0644 agent/prompt_builder.py /opt/hermes/agent/prompt_builder.py
 COPY --chown=root:root --chmod=0644 agent/tool_executor.py /opt/hermes/agent/tool_executor.py
 COPY --chown=root:root --chmod=0644 agent/transports/hermes_tools_mcp_server.py /opt/hermes/agent/transports/hermes_tools_mcp_server.py
+COPY --chown=root:root --chmod=0644 tools/kanban_tools.py /opt/hermes/tools/kanban_tools.py
 COPY --chown=root:root --chmod=0644 gateway/run.py /opt/hermes/gateway/run.py
 COPY --chown=root:root --chmod=0644 gateway/session.py /opt/hermes/gateway/session.py
 COPY --chown=root:root --chmod=0644 plugins/dashboard_auth/self_hosted/__init__.py /opt/hermes/plugins/dashboard_auth/self_hosted/__init__.py
