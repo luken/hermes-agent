@@ -769,7 +769,7 @@ hermes kanban dispatch [--dry-run] [--max N]           # one-shot pass
 hermes kanban daemon --force                           # DEPRECATED — standalone dispatcher (use `hermes gateway start` instead)
         [--failure-limit N] [--pidfile PATH] [-v]
 hermes kanban stats [--json]                           # per-status + per-assignee counts
-hermes kanban log <id> [--tail BYTES]                  # worker log from ~/.hermes/kanban/logs/
+hermes kanban log <id> [--run-id N] [--tail BYTES]     # aggregate task log, or one run's isolated log
 hermes kanban notify-subscribe <id>                    # gateway bridge hook (used by /kanban in the gateway)
         --platform <name> --chat-id <id> [--thread-id <id>] [--user-id <id>]
         [--chat-type dm|group|channel|thread] [--delivery-mode notify|notify+wake|wake]
@@ -1074,6 +1074,11 @@ Runs are also where **structured handoff** lives. When a worker completes a task
 - `result` (tool param) / `--result` (CLI) — short log line that goes on the task row (legacy field, kept for back-compat).
 
 Downstream children read the most recent completed run's summary + metadata for each parent. Retrying workers read the prior attempts on their own task (outcome, summary, error) so they don't repeat a path that already failed.
+
+Each dispatched run also writes its own worker log. Use `hermes kanban log <id>
+--run-id <run-id>` to inspect one attempt without output from older or newer
+workers. Omitting `--run-id` returns a bounded aggregate with explicit run
+headings for task-level troubleshooting.
 
 ```
 # What a worker actually does — a tool call, from inside the agent loop:
