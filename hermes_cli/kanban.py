@@ -873,6 +873,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Print the worker log for a task (from <kanban-root>/kanban/logs/)",
     )
     p_log.add_argument("task_id")
+    p_log.add_argument("--run-id", type=int, default=None,
+                       help="Print only this exact worker run")
     p_log.add_argument("--tail", type=int, default=None,
                        help="Only print the last N bytes")
 
@@ -3027,7 +3029,11 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
 
 
 def _cmd_log(args: argparse.Namespace) -> int:
-    content = kb.read_worker_log(args.task_id, tail_bytes=args.tail)
+    content = kb.read_worker_log(
+        args.task_id,
+        tail_bytes=args.tail,
+        run_id=args.run_id,
+    )
     if content is None:
         print(f"(no log for {args.task_id} — task may not have spawned yet)",
               file=sys.stderr)

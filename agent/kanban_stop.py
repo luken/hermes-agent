@@ -1,23 +1,33 @@
-"""Turn-end guard for kanban workers.
+"""Run-lifecycle guards for dispatcher-owned Kanban workers.
 
-Kanban workers must end with ``kanban_complete`` or ``kanban_block``. Models
-(especially GLM / Qwen families) sometimes narrate the next step
+Each worker owns one exact ``task_runs`` row. Card-terminal transitions and
+same-card review handoffs both close that run, so the process must stop before
+another provider call or tool side effect. Models sometimes narrate the next step
 ("Let me write the report now") and stop with ``finish_reason=stop`` and no
 tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
 ``protocol_violation``.
 
-This module is policy-only: when a kanban worker tries to finish without a
-terminal board tool, return a bounded synthetic nudge so the conversation
-loop continues instead of exiting.
+The ownership check is deliberately read-only and fail-open. The existing
+claim lease and orphan reconciler remain the recovery authority when SQLite
+cannot be read; this module never invents a board transition.
 """
 
 from __future__ import annotations
 
 import os
+import json
+import sqlite3
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_RUN_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete",
+    "kanban_block",
+    "kanban_request_review",
+    "kanban_request_changes",
+    "kanban_review_pass",
+})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -47,23 +57,74 @@ def _tool_call_name(tc: Any) -> str:
     return str(getattr(tc, "name", "") or "")
 
 
+def _successful_tool_result(content: Any) -> bool:
+    """Return whether a Kanban tool result is the canonical ``{"ok": true}``."""
+    if isinstance(content, dict):
+        return content.get("ok") is True
+    if not isinstance(content, str):
+        return False
+    try:
+        value, _end = json.JSONDecoder().raw_decode(content.lstrip())
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(value, dict) and value.get("ok") is True
+
+
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
-    """True if this conversation already invoked a terminal kanban tool."""
+    """True if this conversation completed a run-terminal Kanban tool.
+
+    The tool result, not merely the assistant's requested call, is authority.
+    A rejected completion or review transition leaves the run live and must not
+    suppress the stop nudge.
+    """
     if not messages:
         return False
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        role = msg.get("role")
-        if role == "assistant":
-            for tc in msg.get("tool_calls") or []:
-                if _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS:
-                    return True
-        elif role == "tool":
+        if msg.get("role") == "tool":
             name = str(msg.get("name") or "")
-            if name in _TERMINAL_KANBAN_TOOLS:
+            if (
+                name in _RUN_TERMINAL_KANBAN_TOOLS
+                and _successful_tool_result(msg.get("content"))
+            ):
                 return True
     return False
+
+
+def kanban_worker_run_is_current() -> bool:
+    """Return False only when this dispatched worker definitely lost its run.
+
+    Processes without the dispatcher environment, malformed environment, and
+    transient SQLite read failures return True (fail open). A valid lookup that
+    finds a different/non-running run returns False.
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run_text = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    db_text = (os.environ.get("HERMES_KANBAN_DB") or "").strip()
+    if not task_id or not run_text or not db_text:
+        return True
+    try:
+        run_id = int(run_text)
+        if run_id <= 0:
+            return True
+        db_uri = Path(db_text).expanduser().resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True, timeout=0.1)
+        try:
+            row = conn.execute(
+                "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return True
+    if row is None or row[0] != "running" or row[1] is None:
+        return False
+    if int(row[1]) != run_id:
+        return False
+    expected_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    return not expected_lock or str(row[2] or "") == expected_lock
 
 
 def build_kanban_stop_nudge(
@@ -104,5 +165,6 @@ def build_kanban_stop_nudge(
 __all__ = [
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
+    "kanban_worker_run_is_current",
     "session_called_kanban_terminal",
 ]

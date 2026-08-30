@@ -2,7 +2,7 @@ name: Omner native OIDC image
 
 on:
   push:
-    branches: [codex/hermes-status-convergence-production]
+    branches: [omner/production]
   workflow_dispatch:
 
 permissions:
@@ -46,7 +46,7 @@ jobs:
           file: docker/omner-native-oidc.Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/luken/hermes-agent:omner-status-convergence-v2026.8.29-r1
+          tags: ghcr.io/luken/hermes-agent:omner-run-ownership-v2026.8.30-r1
           sbom: true
           provenance: mode=max
           build-args: |
@@ -67,7 +67,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hermes-hindsight-trivy-${{ github.sha }}
+          name: hermes-run-ownership-trivy-${{ github.sha }}
           path: trivy-results.json
           if-no-files-found: error
           retention-days: 90
@@ -85,7 +85,7 @@ jobs:
           DIGEST: ${{ steps.image.outputs.digest }}
         run: |
           cosign verify \
-            --certificate-identity 'https://github.com/luken/hermes-agent/.github/workflows/omner-native-oidc-image.yml@refs/heads/codex/hermes-status-convergence-production' \
+            --certificate-identity 'https://github.com/luken/hermes-agent/.github/workflows/omner-native-oidc-image.yml@refs/heads/omner/production' \
             --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
             "ghcr.io/luken/hermes-agent@${DIGEST}"
           echo "ghcr.io/luken/hermes-agent@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"

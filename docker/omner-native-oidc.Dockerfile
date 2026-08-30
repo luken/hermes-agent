@@ -2,7 +2,7 @@ FROM docker.io/nousresearch/hermes-agent:v2026.8.19@sha256:3811ed13da874fba2ac99
 
 ARG HERMES_GIT_SHA
 LABEL org.opencontainers.image.revision="${HERMES_GIT_SHA}"
-LABEL org.opencontainers.image.source="https://github.com/luken/hermes-agent/tree/codex/hermes-status-convergence-production"
+LABEL org.opencontainers.image.source="https://github.com/luken/hermes-agent/tree/omner/production"
 LABEL org.opencontainers.image.base.revision="fcbd1076a93841fa88855acce810e342a5b78101"
 
 # The pinned upstream runtime predates two fixed critical packages. Keep this
@@ -23,8 +23,13 @@ COPY --chown=root:root --chmod=0644 hermes_cli/dashboard_auth/native_redirects.p
 COPY --chown=root:root --chmod=0644 hermes_cli/dashboard_auth/routes.py /opt/hermes/hermes_cli/dashboard_auth/routes.py
 COPY --chown=root:root --chmod=0644 hermes_cli/kanban.py /opt/hermes/hermes_cli/kanban.py
 COPY --chown=root:root --chmod=0644 hermes_cli/kanban_db.py /opt/hermes/hermes_cli/kanban_db.py
+COPY --chown=root:root --chmod=0644 cli.py /opt/hermes/cli.py
 COPY --chown=root:root --chmod=0644 acp_adapter/tools.py /opt/hermes/acp_adapter/tools.py
+COPY --chown=root:root --chmod=0644 agent/conversation_loop.py /opt/hermes/agent/conversation_loop.py
+COPY --chown=root:root --chmod=0644 agent/error_classifier.py /opt/hermes/agent/error_classifier.py
+COPY --chown=root:root --chmod=0644 agent/kanban_stop.py /opt/hermes/agent/kanban_stop.py
 COPY --chown=root:root --chmod=0644 agent/prompt_builder.py /opt/hermes/agent/prompt_builder.py
+COPY --chown=root:root --chmod=0644 agent/tool_executor.py /opt/hermes/agent/tool_executor.py
 COPY --chown=root:root --chmod=0644 agent/transports/hermes_tools_mcp_server.py /opt/hermes/agent/transports/hermes_tools_mcp_server.py
 COPY --chown=root:root --chmod=0644 gateway/run.py /opt/hermes/gateway/run.py
 COPY --chown=root:root --chmod=0644 gateway/session.py /opt/hermes/gateway/session.py

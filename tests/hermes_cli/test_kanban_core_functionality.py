@@ -237,6 +237,42 @@ def test_read_worker_log_tail(kanban_home):
     assert kb.read_worker_log("t_missing") is None
 
 
+def test_run_scoped_logs_are_isolated_and_aggregated_in_run_order(kanban_home):
+    log_dir = kanban_home / "kanban" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    kb.worker_log_path("t_runs").write_text("legacy\n")
+    run_12 = kb.worker_log_path("t_runs", run_id=12)
+    run_9 = kb.worker_log_path("t_runs", run_id=9)
+    run_12.write_text("reviewer output\n")
+    run_9.write_text("builder output\n")
+
+    assert run_9 != run_12
+    assert kb.read_worker_log("t_runs", run_id=9) == "builder output\n"
+
+    combined = kb.read_worker_log("t_runs")
+    assert combined is not None
+    assert combined.index("===== legacy task log =====") < combined.index(
+        "===== run 9 ====="
+    )
+    assert combined.index("===== run 9 =====") < combined.index(
+        "===== run 12 ====="
+    )
+    assert "builder output" in combined
+    assert "reviewer output" in combined
+
+
+def test_run_scoped_log_tail_is_bounded(kanban_home):
+    log_dir = kanban_home / "kanban" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    kb.worker_log_path("t_runs", run_id=1).write_text("old line\n")
+    kb.worker_log_path("t_runs", run_id=2).write_text("new line\n")
+
+    tail = kb.read_worker_log("t_runs", tail_bytes=24)
+    assert tail is not None
+    assert len(tail.encode()) <= 24
+    assert "new line" in tail
+
+
 # ---------------------------------------------------------------------------
 # CLI bulk verbs
 # ---------------------------------------------------------------------------
@@ -1406,5 +1442,3 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
-

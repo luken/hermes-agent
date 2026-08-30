@@ -1953,6 +1953,18 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        try:
+            from agent.kanban_stop import kanban_worker_run_is_current
+
+            _kanban_run_current = kanban_worker_run_is_current()
+        except Exception:
+            logger.debug("kanban run-ownership check failed", exc_info=True)
+            _kanban_run_current = True
+        if not _kanban_run_current:
+            _turn_exit_reason = "kanban_run_ownership_lost"
+            final_response = ""
+            break
+
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -7323,6 +7335,34 @@ def run_conversation(
                     except Exception:
                         pass
 
+                try:
+                    from agent.kanban_stop import kanban_worker_run_is_current
+
+                    _kanban_run_current = kanban_worker_run_is_current()
+                except Exception:
+                    logger.debug("kanban pre-tool ownership check failed", exc_info=True)
+                    _kanban_run_current = True
+                if not _kanban_run_current:
+                    from agent.tool_executor import _append_cancelled_tool_results
+
+                    _append_cancelled_tool_results(
+                        messages,
+                        assistant_message.tool_calls,
+                        reason="kanban run ownership changed",
+                    )
+                    try:
+                        agent._flush_messages_to_session_db(
+                            messages, conversation_history
+                        )
+                    except Exception:
+                        logger.debug(
+                            "kanban ownership-loss persistence failed",
+                            exc_info=True,
+                        )
+                    _turn_exit_reason = "kanban_run_ownership_lost_before_tools"
+                    final_response = ""
+                    break
+
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if getattr(agent, "_incremental_persistence_failed", False):
@@ -7355,6 +7395,22 @@ def run_conversation(
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass
+                    break
+
+                try:
+                    from agent.kanban_stop import session_called_kanban_terminal
+
+                    _kanban_run_transitioned = session_called_kanban_terminal(
+                        messages
+                    )
+                except Exception:
+                    logger.debug(
+                        "kanban run-terminal result check failed", exc_info=True
+                    )
+                    _kanban_run_transitioned = False
+                if _kanban_run_transitioned:
+                    _turn_exit_reason = "kanban_run_transitioned"
+                    final_response = ""
                     break
 
                 # Reset per-turn retry counters after successful tool

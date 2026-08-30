@@ -231,6 +231,17 @@ _OVERLOADED_PATTERNS = [
     "over capacity",
 ]
 
+# Explicit local-inference admission failures. oMLX includes remediation text
+# such as "reduce context length" in this diagnostic, but the request was
+# rejected because unified-memory pressure persisted before admission. Match
+# this narrow capacity signal before all status/context heuristics so Hermes
+# backs off without deleting healthy conversation history.
+_CAPACITY_ADMISSION_PATTERNS = [
+    "admission_paused",
+    "could not be admitted because memory pressure persisted",
+    "memory pressure persisted for",
+]
+
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
 _USAGE_LIMIT_PATTERNS = [
     "usage limit",
@@ -854,6 +865,13 @@ def classify_api_error(
             FailoverReason.content_policy_blocked,
             retryable=False,
             should_fallback=True,
+        )
+
+    if any(p in error_msg for p in _CAPACITY_ADMISSION_PATTERNS):
+        return _result(
+            FailoverReason.overloaded,
+            retryable=True,
+            should_compress=False,
         )
 
     # Anthropic thinking block recovery (400).  Two distinct failure modes,
