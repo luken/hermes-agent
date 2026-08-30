@@ -1084,6 +1084,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # avoids rebuilding it per result inside the loop below).
     _tool_budget = _budget_for_agent(agent)
 
+    from agent.kanban_stop import kanban_worker_run_is_current
+    if not kanban_worker_run_is_current():
+        _append_cancelled_tool_results(
+            messages, tool_calls, reason="kanban run ownership changed"
+        )
+        _flush_session_db_after_tool_progress(
+            agent, messages, stage="kanban run ownership changed"
+        )
+        return
+
     # ── Pre-flight: interrupt check ──────────────────────────────────
     if agent._interrupt_requested:
         print(f"{agent.log_prefix}⚡ Interrupt: skipping {num_tools} tool call(s)")
@@ -1932,6 +1942,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        from agent.kanban_stop import kanban_worker_run_is_current
+        if not kanban_worker_run_is_current():
+            remaining_calls = assistant_message.tool_calls[i-1:]
+            _append_cancelled_tool_results(
+                messages,
+                remaining_calls,
+                reason="kanban run ownership changed",
+            )
+            _flush_session_db_after_tool_progress(
+                agent, messages, stage="kanban run ownership changed"
+            )
+            break
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.
