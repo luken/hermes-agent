@@ -116,6 +116,114 @@ def test_single_query_main_skips_clear_on_exit_summary(monkeypatch):
     )
 
 
+# ── Structured single-query exit status ────────────────────────────────────
+
+def test_human_single_query_propagates_structured_failure(monkeypatch):
+    calls = []
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.console = SimpleNamespace(print=lambda *_a, **_kw: None)
+            self.session_id = "failed-query"
+            self.agent = SimpleNamespace(session_id="failed-query", platform="cli")
+            self._last_turn_result = None
+
+        def _claim_active_session(self, surface, *, stderr=False):
+            return True
+
+        def _show_security_advisories(self):
+            pass
+
+        def chat(self, query, images=None):
+            self._last_turn_result = {
+                "failed": True,
+                "failure_reason": "overloaded",
+                "error": "admission_paused",
+            }
+            return "Error: admission_paused"
+
+        def _print_exit_summary(self, clear_screen=True):
+            calls.append(("summary", clear_screen))
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "_finalize_single_query",
+        lambda fake_cli: calls.append(("finalize", fake_cli.session_id)),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli_mod.main(query="hello", quiet=False, toolsets="terminal")
+
+    assert exc.value.code == 1
+    assert calls == [("summary", False), ("finalize", "failed-query")]
+
+
+def test_single_query_rate_limit_uses_kanban_temporary_failure(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
+    from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+
+    assert cli_mod._single_query_exit_code({
+        "failed": True,
+        "failure_reason": "rate_limit",
+    }) == KANBAN_RATE_LIMIT_EXIT_CODE
+
+
+# ── Structured single-query exit status ────────────────────────────────────
+
+def test_human_single_query_propagates_structured_failure(monkeypatch):
+    calls = []
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.console = SimpleNamespace(print=lambda *_a, **_kw: None)
+            self.session_id = "failed-query"
+            self.agent = SimpleNamespace(session_id="failed-query", platform="cli")
+            self._last_turn_result = None
+
+        def _claim_active_session(self, surface, *, stderr=False):
+            return True
+
+        def _show_security_advisories(self):
+            pass
+
+        def chat(self, query, images=None):
+            self._last_turn_result = {
+                "failed": True,
+                "failure_reason": "overloaded",
+                "error": "admission_paused",
+            }
+            return "Error: admission_paused"
+
+        def _print_exit_summary(self, clear_screen=True):
+            calls.append(("summary", clear_screen))
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "_finalize_single_query",
+        lambda fake_cli: calls.append(("finalize", fake_cli.session_id)),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli_mod.main(query="hello", quiet=False, toolsets="terminal")
+
+    assert exc.value.code == 1
+    assert calls == [("summary", False), ("finalize", "failed-query")]
+
+
+def test_single_query_rate_limit_uses_kanban_temporary_failure(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
+    from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+
+    assert cli_mod._single_query_exit_code({
+        "failed": True,
+        "failure_reason": "rate_limit",
+    }) == KANBAN_RATE_LIMIT_EXIT_CODE
+
+
 # ── Verify interactive mode still clears ────────────────────────────────────
 
 def test_print_exit_summary_still_clears_in_interactive_path(monkeypatch):

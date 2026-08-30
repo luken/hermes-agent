@@ -1261,6 +1261,28 @@ class TestThrottleVsOverflowDisambiguation:
 class TestExpandedOverflowPatterns:
     """New provider overflow wordings route into compression recovery."""
 
+    @pytest.mark.parametrize("status_code", [None, 400, 500, 503])
+    def test_omlx_memory_admission_pressure_is_overload_not_context(
+        self, status_code
+    ):
+        diagnostic = (
+            "Request could not be admitted because memory pressure persisted "
+            "for 60.0s (admission_paused). Raise kernel "
+            "iogpu.wired_limit_mb, reduce context length, or lower "
+            "hot_cache_max_size."
+        )
+        error = MockAPIError(diagnostic, status_code=status_code)
+
+        result = classify_api_error(
+            error,
+            provider="openai-compat",
+            model="ds4flash",
+        )
+
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_compress is False
+
     def test_maximum_allowed_input_length_is_overflow(self):
         # Together/Fireworks-style wording — matched no pattern before.
         e = Exception(
@@ -1270,6 +1292,26 @@ class TestExpandedOverflowPatterns:
         result = classify_api_error(e, provider="together", model="m")
         assert result.reason == FailoverReason.context_overflow
         assert result.should_compress is True
+
+
+@pytest.mark.parametrize("status_code", [None, 400, 500, 503])
+def test_omlx_memory_admission_pressure_is_overload_not_context(status_code):
+    diagnostic = (
+        "Request could not be admitted because memory pressure persisted for "
+        "60.0s (admission_paused). Raise kernel iogpu.wired_limit_mb, reduce "
+        "context length, or lower hot_cache_max_size."
+    )
+    error = MockAPIError(diagnostic, status_code=status_code)
+
+    result = classify_api_error(
+        error,
+        provider="openai-compat",
+        model="ds4flash",
+    )
+
+    assert result.reason == FailoverReason.overloaded
+    assert result.retryable is True
+    assert result.should_compress is False
 
     def test_request_too_large_message_only_is_payload_too_large(self):
         # Anthropic's structured 413 type re-wrapped by a proxy with no
@@ -1290,5 +1332,3 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
-
-
