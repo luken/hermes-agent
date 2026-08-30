@@ -46,7 +46,7 @@ jobs:
           file: docker/omner-native-oidc.Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/luken/hermes-agent:omner-run-ownership-v2026.8.30-r1
+          tags: ghcr.io/luken/hermes-agent:omner-work-admission-v2026.8.30-r1
           sbom: true
           provenance: mode=max
           build-args: |
@@ -67,7 +67,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hermes-run-ownership-trivy-${{ github.sha }}
+          name: hermes-work-admission-trivy-${{ github.sha }}
           path: trivy-results.json
           if-no-files-found: error
           retention-days: 90

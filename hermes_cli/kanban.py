@@ -478,6 +478,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
 
+    p_set_skills = sub.add_parser(
+        "set-skills",
+        help="Replace a task's forced skills after assignee-profile validation",
+    )
+    p_set_skills.add_argument("task_id")
+    p_set_skills.add_argument(
+        "skills", nargs="*",
+        help="Exact skill names; omit all names to clear forced skills",
+    )
+
     # --- set-model (per-task model/provider override) ---
     p_set_model = sub.add_parser(
         "set-model",
@@ -504,6 +514,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reclaim.add_argument(
         "--reason", default=None,
         help="Human-readable reason (recorded on the reclaimed event)",
+    )
+    p_reclaim.add_argument(
+        "--continuity", action="store_true",
+        help="Do not consume failure budget for a proven rollout-replaced worker",
+    )
+    p_reclaim.add_argument(
+        "--failure-limit", type=int, default=None,
+        help="Managed retry limit used when this reclaim counts as a failure",
     )
 
     p_reassign = sub.add_parser(
@@ -1124,6 +1142,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "ls":       _cmd_list,
             "show":     _cmd_show,
             "assign":   _cmd_assign,
+            "set-skills": _cmd_set_skills,
             "set-model": _cmd_set_model,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
@@ -1197,6 +1216,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "create",
     "swarm",
     "assign",
+    "set-skills",
     "reclaim",
     "reassign",
     "link",
@@ -1881,6 +1901,21 @@ def _cmd_assign(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_set_skills(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_task_skills(conn, args.task_id, args.skills)
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    label = ", ".join(args.skills) if args.skills else "(none)"
+    print(f"Set forced skills on {args.task_id}: {label}")
+    return 0
+
+
 def _cmd_set_model(args: argparse.Namespace) -> int:
     model = args.model
     if model is not None and model.lower() in {"none", "-", "null", ""}:
@@ -1910,6 +1945,8 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         ok = kb.reclaim_task(
             conn, args.task_id,
             reason=getattr(args, "reason", None),
+            continuity=bool(getattr(args, "continuity", False)),
+            failure_limit=getattr(args, "failure_limit", None),
         )
     if not ok:
         print(

@@ -3155,6 +3155,86 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def available_profile_skill_names(profile: str) -> set[str]:
+    """Return force-loadable skill names for one isolated worker profile.
+
+    Kanban dispatch changes ``HERMES_HOME`` before starting the worker, so the
+    dispatcher's own skill catalog is not authoritative.  Resolve and scan the
+    assignee profile using the same platform/environment/disabled gates as the
+    runtime skill index.  Project-local skills are intentionally excluded:
+    worktree creation happens after admission and a forced skill must remain
+    available when the task is re-created in a fresh checkout.
+    """
+    from agent.skill_utils import (
+        get_all_skills_dirs,
+        get_disabled_skill_names,
+        iter_skill_index_files,
+        parse_frontmatter,
+        skill_matches_environment,
+        skill_matches_platform,
+    )
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile_home = resolve_profile_env(profile)
+    token = set_hermes_home_override(profile_home)
+    try:
+        disabled = get_disabled_skill_names()
+        names: set[str] = set()
+        for skills_dir in get_all_skills_dirs():
+            if not skills_dir.is_dir():
+                continue
+            for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
+                try:
+                    content = skill_file.read_text(
+                        encoding="utf-8-sig", errors="replace"
+                    )[:4000]
+                    frontmatter, _body = parse_frontmatter(content)
+                    name = str(
+                        frontmatter.get("name", skill_file.parent.name)
+                    ).strip()
+                    if (
+                        name
+                        and name not in disabled
+                        and skill_matches_platform(frontmatter)
+                        and skill_matches_environment(frontmatter)
+                    ):
+                        names.add(name)
+                except (OSError, UnicodeError, ValueError, TypeError):
+                    continue
+        # Do not invoke plugin discovery here. It mutates the process-global
+        # plugin manager and can replace already-registered lifecycle hooks in
+        # the long-lived dispatcher. Plugin-owned skill directories that are
+        # actually exposed to the profile are already returned by
+        # get_all_skills_dirs(); an undiscovered optional plugin is not a safe
+        # forced-skill dependency for deterministic worker startup.
+        return names
+    finally:
+        reset_hermes_home_override(token)
+
+
+def validate_profile_skills(profile: Optional[str], skills: Optional[Iterable[str]]) -> None:
+    """Reject a task whose forced skills cannot load in its assignee profile."""
+    requested = [str(name).strip() for name in (skills or ()) if str(name).strip()]
+    if not requested:
+        return
+    if not profile:
+        raise ValueError("forced skills require an assigned worker profile")
+    try:
+        available = available_profile_skill_names(profile)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            "worker_configuration: assigned profile is unavailable for forced "
+            f"skills: {_canonical_assignee(profile)!r}"
+        ) from exc
+    missing = sorted(set(requested) - available)
+    if missing:
+        raise ValueError(
+            "worker_configuration: forced skill(s) unavailable for profile "
+            f"{_canonical_assignee(profile)!r}: {', '.join(missing)}"
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3392,6 +3472,8 @@ def create_task(
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
         skills_list = cleaned
+
+    validate_profile_skills(assignee, skills_list)
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -3706,6 +3788,20 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
+    row = conn.execute(
+        "SELECT status, claim_lock, assignee, skills FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        return False
+    task_skills: list[str] = []
+    if row["skills"]:
+        try:
+            parsed_skills = json.loads(row["skills"])
+            if isinstance(parsed_skills, list):
+                task_skills = [str(item) for item in parsed_skills if item]
+        except (json.JSONDecodeError, TypeError):
+            raise ValueError(f"task {task_id} has malformed skills metadata")
+    validate_profile_skills(profile, task_skills)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -3732,6 +3828,70 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
     # has committed so subscribers always observe durable board state.
     notify_task_updated(conn, task_id, ("assignee",))
+    return True
+
+
+def set_task_skills(
+    conn: sqlite3.Connection,
+    task_id: str,
+    skills: Optional[Iterable[str]],
+) -> bool:
+    """Replace a task's forced-skill list after profile-aware validation.
+
+    This is an operator recovery surface for legacy tasks that predate skill
+    admission or whose profile inventory changed after creation.  Running
+    tasks are rejected so their durable configuration cannot change under an
+    active worker; reclaim first, repair the metadata, then redispatch.
+    """
+    requested: list[str] = []
+    seen: set[str] = set()
+    for item in skills or ():
+        name = str(item).strip()
+        if not name or name in seen:
+            continue
+        if "," in name:
+            raise ValueError(
+                f"skill name cannot contain comma: {name!r} "
+                "(pass separate skill arguments)"
+            )
+        if name.casefold() in KNOWN_TOOLSET_NAMES:
+            raise ValueError(
+                f"{name!r} is a toolset name, not a skill name"
+            )
+        seen.add(name)
+        requested.append(name)
+
+    row = conn.execute(
+        "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return False
+    if row["status"] == "running" or row["claim_lock"] is not None:
+        raise RuntimeError(
+            f"cannot change skills on {task_id}: task has an active worker; "
+            "reclaim it first"
+        )
+    validate_profile_skills(row["assignee"], requested)
+    encoded = json.dumps(requested) if requested else None
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not current:
+            return False
+        if current["status"] == "running" or current["claim_lock"] is not None:
+            raise RuntimeError(
+                f"cannot change skills on {task_id}: task has an active worker; "
+                "reclaim it first"
+            )
+        # Re-check against the assignee observed under the write lock. Another
+        # operator may have reassigned the unclaimed task between the initial
+        # validation and this transaction.
+        validate_profile_skills(current["assignee"], requested)
+        conn.execute("UPDATE tasks SET skills = ? WHERE id = ?", (encoded, task_id))
+        _append_event(conn, task_id, "skills_updated", {"skills": requested})
+    notify_task_updated(conn, task_id, ("skills",))
     return True
 
 
@@ -4948,6 +5108,7 @@ def release_stale_claims(
     conn: sqlite3.Connection,
     *,
     signal_fn=None,
+    failure_limit: Optional[int] = None,
 ) -> int:
     """Reset any ``running`` task whose claim has expired.
 
@@ -5082,6 +5243,7 @@ def release_stale_claims(
                 "host_local": host_local,
                 "heartbeat_stale": bool(heartbeat_stale),
                 "retry_status": retry_status,
+                "failure_fingerprint": _error_fingerprint("stale claim recovery"),
             }
             payload.update(termination)
             _append_event(
@@ -5090,6 +5252,16 @@ def release_stale_claims(
                 run_id=run_id,
             )
             reclaimed += 1
+        _record_task_failure(
+            conn,
+            row["id"],
+            error="stale claim recovery",
+            outcome="reclaimed",
+            failure_limit=failure_limit,
+            release_claim=False,
+            end_run=False,
+            event_payload_extra={"recovery": "stale_claim"},
+        )
         # Worker-lifecycle observer (RFC #58548): the reclaim txn above has
         # committed. The ``continue`` branches (rowcount mismatch, claim
         # extension, deferred reclaim) never reach this point, so only a
@@ -5117,6 +5289,8 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    continuity: bool = False,
+    failure_limit: Optional[int] = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and restore its source phase.
 
@@ -5125,6 +5299,11 @@ def reclaim_task(
     regardless of TTL. Intended for the dashboard/CLI recovery flow
     when an operator wants to abort a running worker without waiting
     for the TTL to expire (e.g. after seeing a hallucination warning).
+
+    Reclaims consume the task's unified failure budget because a worker that
+    repeatedly vanishes before a terminal transition is a failed attempt.
+    ``continuity=True`` is the narrow exception for a proven foreign-Pod run
+    interrupted by an intentional rollout; it preserves the prior counter.
 
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
@@ -5167,6 +5346,10 @@ def reclaim_task(
             "reason": reason,
             "prev_lock": prev_lock,
             "retry_status": retry_status,
+            "continuity": bool(continuity),
+            "failure_fingerprint": _error_fingerprint(
+                "rollout continuity" if continuity else "manual reclaim"
+            ),
         }
         payload.update(termination)
         _append_event(
@@ -5174,11 +5357,17 @@ def reclaim_task(
             payload,
             run_id=run_id,
         )
-    # Operator intervention — they've looked at the task, so the
-    # consecutive-failures counter is now stale. Give the next retry
-    # a fresh budget. (_clear_failure_counter opens its own write_txn,
-    # so it runs after the enclosing one commits.)
-    _clear_failure_counter(conn, task_id)
+    if not continuity:
+        _record_task_failure(
+            conn,
+            task_id,
+            error=(f"manual reclaim: {reason}" if reason else "manual reclaim"),
+            outcome="reclaimed",
+            failure_limit=failure_limit,
+            release_claim=False,
+            end_run=False,
+            event_payload_extra={"recovery": "manual"},
+        )
     return True
 
 
@@ -6643,6 +6832,18 @@ def request_review(
                 "summary": event_summary or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
+                "handoff_head": (
+                    metadata.get("handoff_gate", {}).get("head_commit")
+                    if isinstance(metadata, dict)
+                    and isinstance(metadata.get("handoff_gate"), dict)
+                    else None
+                ),
+                "handoff_base": (
+                    metadata.get("handoff_gate", {}).get("base_commit")
+                    if isinstance(metadata, dict)
+                    and isinstance(metadata.get("handoff_gate"), dict)
+                    else None
+                ),
             },
             run_id=run_id,
         )
@@ -6727,7 +6928,33 @@ def request_changes(
         else:
             reviewer = None
 
-        new_status = _landing_status_after_parents(conn, task_id)
+        handoff_head = requested_payload.get("handoff_head")
+        handoff_base = requested_payload.get("handoff_base")
+        previous_rounds = 0
+        for prior in conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'changes_requested' ORDER BY id",
+            (task_id,),
+        ):
+            try:
+                prior_payload = json.loads(prior["payload"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(prior_payload, dict):
+                continue
+            prior_base = prior_payload.get("handoff_base")
+            if handoff_base:
+                if prior_base == handoff_base:
+                    previous_rounds += 1
+            elif not prior_base:
+                previous_rounds += 1
+        review_round = previous_rounds + 1
+        supervisor_attention = review_round >= 5
+
+        new_status = (
+            "triage" if supervisor_attention
+            else _landing_status_after_parents(conn, task_id)
+        )
         # NOTE: consecutive_failures is deliberately PRESERVED (neither
         # reset nor incremented). Review transitions are not evidence the
         # pathology cleared — only complete_task's success path resets the
@@ -6762,9 +6989,29 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "review_round": review_round,
+                "handoff_head": handoff_head,
+                "handoff_base": handoff_base,
+                "supervisor_attention": supervisor_attention,
             },
             run_id=run_id,
         )
+        if supervisor_attention:
+            _append_event(
+                conn,
+                task_id,
+                "review_escalated",
+                {
+                    "reason": "five changes-requested rounds reached",
+                    "review_round": review_round,
+                    "handoff_head": handoff_head,
+                    "handoff_base": handoff_base,
+                    "implementer": implementer,
+                    "reviewer": reviewer,
+                    "required_action": "supervisor_attention",
+                },
+                run_id=run_id,
+            )
     return True, implementer
 
 
@@ -9389,6 +9636,7 @@ def _record_task_failure(
                 "effective_limit": effective_limit,
                 "limit_source": limit_source,
                 "error": error[:500],
+                "failure_fingerprint": _error_fingerprint(error),
                 "trigger_outcome": outcome,
                 "retry_status": retry_status,
             }
@@ -9431,6 +9679,7 @@ def _record_task_failure(
                     conn, task_id, outcome,
                     {
                         "error": error[:500],
+                        "failure_fingerprint": _error_fingerprint(error),
                         "failures": failures,
                         "retry_status": retry_status,
                     },
@@ -10057,7 +10306,7 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
+    result.reclaimed = release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
@@ -10846,6 +11095,11 @@ def _default_spawn(
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
+    # Legacy rows may predate admission validation, and an installed skill can
+    # be removed after task creation. Fail before opening a log or Popen so the
+    # dispatcher records one ordinary spawn/configuration failure and applies
+    # the task's existing circuit breaker instead of launching a doomed worker.
+    validate_profile_skills(profile_arg, task.skills)
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
