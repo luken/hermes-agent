@@ -126,5 +126,77 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
     assert head == "wt/sibling"
 
 
+def test_dispatch_seeds_new_child_branch_from_parent_handoff(
+    kanban_home, tmp_path, monkeypatch
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    repo = _make_repo(tmp_path)
+    base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    _git(repo, "checkout", "-b", "builder")
+    (repo / "artifact.txt").write_text("builder output\n", encoding="utf-8")
+    _git(repo, "add", "artifact.txt")
+    _git(repo, "commit", "-m", "builder output")
+    builder_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    _git(repo, "checkout", "main")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip() == base
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="builder", assignee="builder")
+        assert kb.complete_task(
+            conn, parent, metadata={"exact_head": builder_head}
+        )
+        child_target = repo / ".worktrees" / "tester"
+        child = kb.create_task(
+            conn,
+            title="tester",
+            assignee="tester",
+            parents=[parent],
+            workspace_kind="worktree",
+            workspace_path=str(child_target),
+            branch_name="wt/tester",
+        )
+        captured = {}
+
+        def spawn(task, workspace, board=None):
+            captured["workspace"] = workspace
+            return 4242
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn, max_in_progress=1)
+
+    assert result.spawned and result.spawned[0][0] == child
+    assert Path(captured["workspace"]) == child_target
+    child_head = subprocess.run(
+        ["git", "-C", str(child_target), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert child_head == builder_head
+    assert (child_target / "artifact.txt").read_text(encoding="utf-8") == "builder output\n"
+
+
+def test_parent_handoff_start_point_prefers_machine_gate(kanban_home):
+    machine_head = "a" * 40
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="builder")
+        assert kb.complete_task(
+            conn,
+            parent,
+            metadata={
+                "exact_head": "b" * 40,
+                "handoff_gate": {"head_commit": machine_head},
+            },
+        )
+        child = kb.create_task(conn, title="tester", parents=[parent])
+        assert kb._parent_handoff_start_point(conn, child) == machine_head
 
 
