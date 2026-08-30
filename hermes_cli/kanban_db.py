@@ -10999,18 +10999,27 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
-    # Redirect output to a per-task log under <board-root>/logs/.
+    # Redirect output to a per-run log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
     # logs don't collide across boards that happen to share task ids.
     log_dir = worker_logs_dir(board=board)
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{task.id}.log"
-    rotate_bytes, backup_count = worker_log_rotation_config()
-    _rotate_worker_log(log_path, rotate_bytes, backup_count)
-
-    # Use 'a' so a re-run on unblock appends rather than overwrites.
-    log_f = open(log_path, "ab")
+    if task.current_run_id is not None:
+        # One file descriptor per immutable run prevents stale/current workers
+        # from byte-interleaving output. Exclusive creation also makes an
+        # accidental duplicate spawn for one run fail closed.
+        log_path = worker_log_path(
+            task.id, run_id=task.current_run_id, board=board
+        )
+        log_f = open(log_path, "xb")
+    else:
+        # Compatibility for direct callers that predate task_runs. Production
+        # dispatcher claims always carry current_run_id and never use this path.
+        log_path = worker_log_path(task.id, board=board)
+        rotate_bytes, backup_count = worker_log_rotation_config()
+        _rotate_worker_log(log_path, rotate_bytes, backup_count)
+        log_f = open(log_path, "ab")
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
@@ -12024,7 +12033,12 @@ def gc_worker_logs(
 # Worker log accessor
 # ---------------------------------------------------------------------------
 
-def worker_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
+def worker_log_path(
+    task_id: str,
+    *,
+    run_id: Optional[int] = None,
+    board: Optional[str] = None,
+) -> Path:
     """Return the path to a worker's log file. The file may not exist
     (task never spawned, or log already GC'd).
 
@@ -12032,17 +12046,19 @@ def worker_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
     current-board file → default). The dispatcher always passes the
     board explicitly to avoid any resolution ambiguity when multiple
     boards exist."""
-    return worker_logs_dir(board=board) / f"{task_id}.log"
+    if run_id is None:
+        name = f"{task_id}.log"
+    else:
+        parsed_run_id = int(run_id)
+        if parsed_run_id <= 0:
+            raise ValueError("run_id must be a positive integer")
+        name = f"{task_id}.run-{parsed_run_id}.log"
+    return worker_logs_dir(board=board) / name
 
 
-def read_worker_log(
-    task_id: str, *, tail_bytes: Optional[int] = None,
-    board: Optional[str] = None,
+def _read_worker_log_path(
+    path: Path, *, tail_bytes: Optional[int] = None
 ) -> Optional[str]:
-    """Read the worker log for ``task_id``. Returns None if the file
-    doesn't exist. If ``tail_bytes`` is set, only the last N bytes are
-    returned (useful for the dashboard drawer which shouldn't page megabytes)."""
-    path = worker_log_path(task_id, board=board)
     if not path.exists():
         return None
     try:
@@ -12052,10 +12068,6 @@ def read_worker_log(
         with open(path, "rb") as f:
             if size > tail_bytes:
                 f.seek(size - tail_bytes)
-                # Skip a partial line if we tailed mid-line. But if the
-                # window has no newline at all (one giant log line),
-                # readline() would eat everything — in that case don't
-                # skip and return the raw tail.
                 probe = f.tell()
                 partial = f.readline()
                 if not partial.endswith(b"\n") and f.tell() >= size:
@@ -12064,6 +12076,60 @@ def read_worker_log(
         return data.decode("utf-8", errors="replace")
     except OSError:
         return None
+
+
+def _worker_run_log_paths(
+    task_id: str, *, board: Optional[str] = None
+) -> list[tuple[int, Path]]:
+    log_dir = worker_logs_dir(board=board)
+    try:
+        entries = list(log_dir.iterdir())
+    except OSError:
+        return []
+    pattern = re.compile(rf"^{re.escape(task_id)}\.run-([1-9][0-9]*)\.log$")
+    found: list[tuple[int, Path]] = []
+    for path in entries:
+        match = pattern.fullmatch(path.name)
+        if match and path.is_file():
+            found.append((int(match.group(1)), path))
+    return sorted(found, key=lambda item: item[0])
+
+
+def read_worker_log(
+    task_id: str, *, tail_bytes: Optional[int] = None,
+    run_id: Optional[int] = None, board: Optional[str] = None,
+) -> Optional[str]:
+    """Read one run log or the deterministic task-level attempt history."""
+    if tail_bytes is not None and tail_bytes <= 0:
+        raise ValueError("tail_bytes must be a positive integer")
+    if run_id is not None:
+        return _read_worker_log_path(
+            worker_log_path(task_id, run_id=run_id, board=board),
+            tail_bytes=tail_bytes,
+        )
+
+    sections: list[str] = []
+    legacy = _read_worker_log_path(worker_log_path(task_id, board=board))
+    if legacy is not None:
+        sections.append(f"===== legacy task log =====\n{legacy}")
+    for attempt_id, path in _worker_run_log_paths(task_id, board=board):
+        content = _read_worker_log_path(path)
+        if content is not None:
+            sections.append(f"===== run {attempt_id} =====\n{content}")
+    if not sections:
+        return None
+
+    combined = "\n".join(section.rstrip("\n") for section in sections) + "\n"
+    if tail_bytes is None:
+        return combined
+    encoded = combined.encode("utf-8", errors="replace")
+    if len(encoded) <= tail_bytes:
+        return combined
+    tail = encoded[-tail_bytes:]
+    newline = tail.find(b"\n")
+    if newline >= 0:
+        tail = tail[newline + 1:]
+    return tail.decode("utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------

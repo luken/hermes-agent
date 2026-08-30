@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 
 def _make_task(kb, *, assignee: str):
@@ -72,6 +73,7 @@ agent:
         captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs.get("env") or {})
         captured["cwd"] = kwargs.get("cwd")
+        captured["stdout"] = kwargs.get("stdout")
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
@@ -83,6 +85,7 @@ agent:
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert Path(captured["stdout"].name).name == "t_spawn_tools.run-7.log"
     assert "--toolsets" in captured["cmd"]
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
