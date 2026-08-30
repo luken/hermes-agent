@@ -30,6 +30,7 @@ COPY --chown=root:root --chmod=0644 agent/error_classifier.py /opt/hermes/agent/
 COPY --chown=root:root --chmod=0644 agent/kanban_stop.py /opt/hermes/agent/kanban_stop.py
 COPY --chown=root:root --chmod=0644 agent/prompt_builder.py /opt/hermes/agent/prompt_builder.py
 COPY --chown=root:root --chmod=0644 agent/tool_executor.py /opt/hermes/agent/tool_executor.py
+COPY --chown=root:root --chmod=0644 agent/verification_evidence.py /opt/hermes/agent/verification_evidence.py
 COPY --chown=root:root --chmod=0644 agent/transports/hermes_tools_mcp_server.py /opt/hermes/agent/transports/hermes_tools_mcp_server.py
 COPY --chown=root:root --chmod=0644 tools/kanban_tools.py /opt/hermes/tools/kanban_tools.py
 COPY --chown=root:root --chmod=0644 gateway/run.py /opt/hermes/gateway/run.py
@@ -38,6 +39,5 @@ COPY --chown=root:root --chmod=0644 plugins/dashboard_auth/self_hosted/__init__.
 COPY --chown=root:root --chmod=0644 plugins/memory/hindsight/__init__.py /opt/hermes/plugins/memory/hindsight/__init__.py
 COPY --chown=root:root --chmod=0644 plugins/platforms/matrix/adapter.py /opt/hermes/plugins/platforms/matrix/adapter.py
 COPY --chown=root:root --chmod=0644 skills/devops/sdlc-review/SKILL.md /opt/hermes/skills/devops/sdlc-review/SKILL.md
-COPY --chown=root:root --chmod=0644 tools/kanban_tools.py /opt/hermes/tools/kanban_tools.py
 COPY --chown=root:root --chmod=0644 toolsets.py /opt/hermes/toolsets.py
 COPY --chown=root:root --chmod=0644 tui_gateway/project_tree.py /opt/hermes/tui_gateway/project_tree.py
