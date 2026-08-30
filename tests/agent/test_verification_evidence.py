@@ -28,6 +28,38 @@ def _python_project(root: Path) -> None:
     (root / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
 
 
+@pytest.mark.parametrize(
+    "executable",
+    [
+        ".venv/bin/python",
+        ".venv/bin/python3",
+        ".venv/bin/python3.13",
+        ".venv/bin/pytest",
+    ],
+)
+def test_virtualenv_executable_path_records_pytest(
+    tmp_path, monkeypatch, executable
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+
+    if executable.endswith("pytest"):
+        command = f"{tmp_path / executable} tests/test_state.py -q"
+    else:
+        command = f"{tmp_path / executable} -m pytest tests/test_state.py -q"
+    evidence = classify_verification_command(
+        command,
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+    )
+
+    assert evidence is not None
+    assert evidence.canonical_command == "pytest"
+    assert evidence.kind == "test"
+    assert evidence.scope == "targeted"
+
+
 
 
 
@@ -71,6 +103,12 @@ def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
         session_id="s1",
         exit_code=0,
     )
+    direct = classify_verification_command(
+        "scripts/run_tests.sh tests/test_widget.py",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+    )
     echoed = classify_verification_command(
         "echo scripts/run_tests.sh tests/test_widget.py",
         cwd=tmp_path,
@@ -81,6 +119,8 @@ def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
     assert wrapped is not None
     assert wrapped.canonical_command == "scripts/run_tests.sh"
     assert wrapped.scope == "targeted"
+    assert direct is not None
+    assert direct.canonical_command == "scripts/run_tests.sh"
     assert echoed is None
 
 
@@ -244,6 +284,27 @@ def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, m
     assert evidence.canonical_command == "ad-hoc verification script"
     assert evidence.kind == "ad_hoc"
     assert evidence.scope == "targeted"
+    assert evidence.status == "passed"
+
+
+def test_virtualenv_python_records_temp_ad_hoc_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    script = Path(tempfile.gettempdir()) / f"hermes-ad-hoc-{tmp_path.name}.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    try:
+        evidence = classify_verification_command(
+            f"{tmp_path / '.venv/bin/python'} {script}",
+            cwd=tmp_path,
+            session_id="s1",
+            exit_code=0,
+            output="ok",
+        )
+    finally:
+        script.unlink(missing_ok=True)
+
+    assert evidence is not None
+    assert evidence.canonical_command == "ad-hoc verification script"
     assert evidence.status == "passed"
 
 

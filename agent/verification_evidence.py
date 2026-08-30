@@ -288,6 +288,19 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
     return remaining
 
 
+def _executable_basename(token: str) -> str:
+    """Return a cross-platform basename for an invoked executable token."""
+    executable = token.replace("\\", "/").rsplit("/", 1)[-1]
+    if executable.lower().endswith(".exe"):
+        executable = executable[:-4]
+    if (
+        executable.startswith("python3.")
+        and executable.removeprefix("python3.").replace(".", "").isdigit()
+    ):
+        executable = "python3"
+    return executable
+
+
 def _equivalent_needles(needle: list[str]) -> list[list[str]]:
     """Return command spellings equivalent to the detected canonical command."""
     candidates = [needle]
@@ -326,8 +339,15 @@ def _find_canonical_match(
         for index, segment in enumerate(segments):
             candidate_tokens = _strip_command_prefix(segment.tokens)
             for candidate in _equivalent_needles(needle):
+                comparable_tokens = list(candidate_tokens)
                 if (
-                    candidate_tokens[:len(candidate)] == candidate
+                    comparable_tokens
+                    and candidate
+                    and _executable_basename(comparable_tokens[0]) == candidate[0]
+                ):
+                    comparable_tokens[0] = candidate[0]
+                if (
+                    comparable_tokens[:len(candidate)] == candidate
                     and _exit_status_is_attributable(segments, index, exit_code)
                 ):
                     return canonical, candidate_tokens[len(candidate):]
@@ -409,7 +429,8 @@ def _ad_hoc_script_args(tokens: list[str], root: str | Path | None) -> Optional[
     command = candidate_tokens[0]
     if _is_temp_script_path(command, root):
         return candidate_tokens[1:]
-    if command in {"python", "python3", "node", "bash", "sh", "ruby", "perl"}:
+    command_name = _executable_basename(command)
+    if command_name in {"python", "python3", "node", "bash", "sh", "ruby", "perl"}:
         for idx, token in enumerate(candidate_tokens[1:], start=1):
             if token == "--":
                 continue
