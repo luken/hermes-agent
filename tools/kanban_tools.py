@@ -90,9 +90,9 @@ def _machine_handoff_gate(
     forced through a code-specific gate.
     """
     if not task or os.environ.get("HERMES_KANBAN_TASK") != task.id:
-        return {"applicable": False, "reason": "operator_transition"}, None
+        return None, None
     if task.workspace_kind != "worktree":
-        return {"applicable": False, "reason": "non_worktree"}, None
+        return None, None
     workspace = str(task.workspace_path or os.environ.get("HERMES_KANBAN_WORKSPACE") or "")
     if not workspace:
         return None, "worktree handoff has no workspace path"
@@ -938,8 +938,9 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"kanban_complete handoff gate rejected the transition: "
                     f"{handoff_error}. The task remains in-flight."
                 )
-            metadata = dict(metadata or {})
-            metadata["handoff_gate"] = handoff_receipt
+            if handoff_receipt is not None:
+                metadata = dict(metadata or {})
+                metadata["handoff_gate"] = handoff_receipt
 
             try:
                 ok = kb.complete_task(
@@ -1128,8 +1129,9 @@ def _handle_request_review(args: dict, **kw) -> str:
                     f"kanban_request_review handoff gate rejected the transition: "
                     f"{handoff_error}. The task remains in-flight."
                 )
-            metadata = dict(metadata or {})
-            metadata["handoff_gate"] = handoff_receipt
+            if handoff_receipt is not None:
+                metadata = dict(metadata or {})
+                metadata["handoff_gate"] = handoff_receipt
             ok, fail_reason = kb.request_review(
                 conn, tid,
                 summary=summary,
