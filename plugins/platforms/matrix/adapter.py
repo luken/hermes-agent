@@ -1415,6 +1415,18 @@ class MatrixAdapter(BasePlatformAdapter):
                 for user_id in str(key_recovery_users_raw).split(",")
                 if user_id.strip()
             }
+        recovery_sessions_raw = config.extra.get("e2ee_key_recovery_sessions", [])
+        self._e2ee_key_recovery_sessions: list[dict[str, str]] = []
+        if isinstance(recovery_sessions_raw, list):
+            for target in recovery_sessions_raw:
+                if not isinstance(target, dict):
+                    continue
+                normalized = {
+                    field: str(target.get(field, "")).strip()
+                    for field in ("user_id", "device_id", "room_id", "session_id")
+                }
+                if all(normalized.values()):
+                    self._e2ee_key_recovery_sessions.append(normalized)
         self._allowed_room_ids: Set[str] = set(self._allowed_rooms)
         ignore_patterns_raw = os.getenv("MATRIX_IGNORE_USER_PATTERNS", "")
         self._ignored_user_patterns: list[re.Pattern[str]] = []
@@ -1482,6 +1494,115 @@ class MatrixAdapter(BasePlatformAdapter):
         if await olm.resolve_trust(device) < olm.share_keys_min_trust:
             reject("Ignoring key request from a device below the key-sharing trust threshold")
         return True
+
+    async def _bootstrap_configured_room_keys(
+        self,
+        olm: Any,
+        crypto_state: _CryptoStateStore,
+    ) -> int:
+        """Forward incident-scoped retained sessions from the live crypto process.
+
+        Some clients only retry their own key backup and never send a
+        cross-user room-key request to the original sender. This temporary
+        bootstrap accepts only an exact configured user, device, room, and
+        session, and applies the same membership, encryption, and trust policy
+        as a received key request before forwarding anything.
+        """
+        if not self._e2ee_key_recovery_sessions:
+            return 0
+
+        from mautrix.crypto import RejectKeyShare
+        from mautrix.types import (
+            DeviceID,
+            EncryptionAlgorithm,
+            EventType,
+            ForwardedRoomKeyEventContent,
+            IdentityKey,
+            RequestedKeyInfo,
+            RoomID,
+            SessionID,
+            UserID,
+        )
+
+        forwarded = 0
+        for target in self._e2ee_key_recovery_sessions:
+            user_id = target["user_id"]
+            if user_id not in self._e2ee_key_recovery_user_ids:
+                logger.warning(
+                    "Matrix: skipped a room-key bootstrap target without recovery access"
+                )
+                continue
+
+            try:
+                device = await olm.get_or_fetch_device(
+                    UserID(user_id), DeviceID(target["device_id"])
+                )
+            except Exception:
+                logger.warning(
+                    "Matrix: failed closed while resolving a room-key bootstrap device"
+                )
+                continue
+            if device is None:
+                logger.warning("Matrix: skipped an unavailable room-key bootstrap device")
+                continue
+
+            room_id = RoomID(target["room_id"])
+            session_id = SessionID(target["session_id"])
+            try:
+                session = await olm.crypto_store.get_group_session(room_id, session_id)
+            except Exception:
+                logger.warning(
+                    "Matrix: failed closed while loading a room-key bootstrap session"
+                )
+                continue
+            if session is None:
+                logger.warning("Matrix: skipped a missing room-key bootstrap session")
+                continue
+
+            request = RequestedKeyInfo(
+                algorithm=EncryptionAlgorithm.MEGOLM_V1,
+                room_id=room_id,
+                sender_key=IdentityKey(session.sender_key),
+                session_id=session_id,
+            )
+            try:
+                if not await self._allow_room_key_share(
+                    olm, crypto_state, device, request
+                ):
+                    continue
+            except RejectKeyShare:
+                logger.warning(
+                    "Matrix: room-key bootstrap target did not pass recovery policy"
+                )
+                continue
+
+            exported_key = session.export_session(session.first_known_index)
+            content = ForwardedRoomKeyEventContent(
+                algorithm=EncryptionAlgorithm.MEGOLM_V1,
+                room_id=session.room_id,
+                session_id=SessionID(session.id),
+                session_key=exported_key,
+                sender_key=session.sender_key,
+                forwarding_key_chain=session.forwarding_chain,
+                signing_key=session.signing_key,
+            )
+            try:
+                await olm.send_encrypted_to_device(
+                    device, EventType.FORWARDED_ROOM_KEY, content
+                )
+            except Exception:
+                logger.warning(
+                    "Matrix: failed to send an authorized room-key bootstrap target"
+                )
+                continue
+            forwarded += 1
+
+        logger.info(
+            "Matrix: completed room-key recovery bootstrap (%d/%d forwarded)",
+            forwarded,
+            len(self._e2ee_key_recovery_sessions),
+        )
+        return forwarded
 
     def _is_duplicate_event(self, event_id) -> bool:
         """Return True if this event was already processed. Tracks the ID otherwise."""
@@ -2244,6 +2365,12 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Share keys after initial sync if E2EE is enabled.
         if self._encryption and getattr(client, "crypto", None):
+            try:
+                await self._bootstrap_configured_room_keys(
+                    client.crypto, client.crypto.state_store
+                )
+            except Exception as exc:
+                logger.warning("Matrix: room-key recovery bootstrap failed: %s", exc)
             try:
                 await client.crypto.share_keys()
             except Exception as exc:
