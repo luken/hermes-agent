@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -76,6 +77,77 @@ def test_profile_skill_validation_honors_configured_skill_roots(
 
     monkeypatch.setattr(skill_utils, "get_all_skills_dirs", lambda: [external])
     kb.validate_profile_skills("builder", ["shared-skill"])
+
+
+def test_profile_skill_validation_allows_environment_hidden_forced_skill(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = (
+        kanban_home
+        / "profiles"
+        / "reviewer"
+        / "skills"
+        / "devops"
+        / "review-skill"
+    )
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: review-skill\n"
+        "description: test review skill\n"
+        "environments: [kanban]\n"
+        "---\n"
+        "Use it.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.skills_tool import skill_view
+
+    token = set_hermes_home_override(resolve_profile_env("reviewer"))
+    try:
+        loaded = json.loads(skill_view("review-skill", preprocess=False))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert loaded["success"] is True
+    kb.validate_profile_skills("reviewer", ["review-skill"])
+
+
+def test_profile_skill_validation_keeps_runtime_loadability_gates(
+    kanban_home: Path,
+) -> None:
+    _profile_skill(kanban_home, "reviewer", "disabled-skill")
+    unsupported = (
+        kanban_home / "profiles" / "reviewer" / "skills" / "unsupported-skill"
+    )
+    unsupported.mkdir(parents=True)
+    (unsupported / "SKILL.md").write_text(
+        "---\n"
+        "name: unsupported-skill\n"
+        "description: test unsupported skill\n"
+        "platforms: [unsupported-test-platform]\n"
+        "---\n"
+        "Use it.\n",
+        encoding="utf-8",
+    )
+    (kanban_home / "profiles" / "reviewer" / "config.yaml").write_text(
+        "skills:\n  disabled:\n    - disabled-skill\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        kb.validate_profile_skills(
+            "reviewer", ["disabled-skill", "unsupported-skill"]
+        )
+
+    error = str(exc_info.value)
+    assert "disabled-skill" in error
+    assert "unsupported-skill" in error
 
 
 def test_operator_can_repair_legacy_skills_only_while_task_is_unclaimed(
