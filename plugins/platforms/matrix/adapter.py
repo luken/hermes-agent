@@ -1604,6 +1604,125 @@ class MatrixAdapter(BasePlatformAdapter):
         )
         return forwarded
 
+    async def _retry_recovery_user_room_keys(self, room_id: str) -> tuple[int, int]:
+        """Retry the current outbound room key for authorized joined users.
+
+        mautrix marks an outbound Megolm session shared even when an individual
+        recipient device had no usable Olm session. The room event can then be
+        sent successfully while that device permanently misses the room key.
+        Recheck the current device list after each logical send and deliver the
+        original ``m.room_key`` for any authorized device that was missed. This
+        is deliberately limited to the configured recovery users and the
+        current outbound session; retained historical sessions still require a
+        client key request or an encrypted Matrix key export.
+        """
+        if not self._e2ee_key_recovery_user_ids:
+            return 0, 0
+        client = self._client
+        olm = getattr(client, "crypto", None) if client is not None else None
+        if olm is None or room_id not in self._joined_rooms:
+            return 0, 0
+
+        typed_room_id = RoomID(room_id)
+        try:
+            if not await olm.state_store.is_encrypted(typed_room_id):
+                return 0, 0
+            joined_members = await client.get_joined_members(typed_room_id)
+        except Exception:
+            logger.warning(
+                "Matrix: skipped room-key delivery retry because room state "
+                "could not be verified"
+            )
+            return 0, 0
+
+        joined_user_ids = {str(user_id) for user_id in joined_members}
+        recovery_users = sorted(
+            self._e2ee_key_recovery_user_ids.intersection(joined_user_ids)
+        )
+        if not recovery_users or str(getattr(client, "mxid", "")) not in joined_user_ids:
+            return 0, 0
+
+        try:
+            session = await olm.crypto_store.get_outbound_group_session(typed_room_id)
+        except Exception:
+            logger.warning("Matrix: failed closed while loading the current room key")
+            return 0, 0
+        if session is None or not session.shared or session.expired:
+            return 0, 0
+
+        try:
+            devices_by_user = await olm._fetch_keys(  # noqa: SLF001
+                [UserID(user_id) for user_id in recovery_users],
+                include_untracked=True,
+            )
+        except Exception:
+            logger.warning("Matrix: failed to refresh recovery-user devices")
+            return 0, len(recovery_users)
+
+        missing_sessions: Dict[Any, Dict[Any, Any]] = {}
+        delivery_sessions: Dict[Any, Dict[Any, Any]] = {}
+        unresolved = 0
+        for user_id in recovery_users:
+            typed_user_id = UserID(user_id)
+            devices = devices_by_user.get(typed_user_id, {})
+            if not devices:
+                unresolved += 1
+                continue
+            for device_id, device in devices.items():
+                target = (typed_user_id, device_id)
+                if (
+                    target in session.users_shared_with
+                    or target in session.users_ignored
+                ):
+                    continue
+                result = await olm._find_olm_sessions(  # noqa: SLF001
+                    session, typed_user_id, device_id, device
+                )
+                if isinstance(result, tuple):
+                    delivery_sessions.setdefault(typed_user_id, {})[device_id] = result
+                elif target not in session.users_ignored:
+                    missing_sessions.setdefault(typed_user_id, {})[device_id] = device
+
+        if missing_sessions:
+            try:
+                await olm._create_outbound_sessions(missing_sessions)  # noqa: SLF001
+            except Exception:
+                logger.warning(
+                    "Matrix: could not create every recovery-user Olm session"
+                )
+            for user_id, devices in missing_sessions.items():
+                for device_id, device in devices.items():
+                    result = await olm._find_olm_sessions(  # noqa: SLF001
+                        session, user_id, device_id, device
+                    )
+                    if isinstance(result, tuple):
+                        delivery_sessions.setdefault(user_id, {})[device_id] = result
+                    elif (user_id, device_id) not in session.users_ignored:
+                        unresolved += 1
+
+        delivered = sum(len(devices) for devices in delivery_sessions.values())
+        if delivery_sessions:
+            try:
+                await olm._encrypt_and_share_group_session(  # noqa: SLF001
+                    session, delivery_sessions
+                )
+                await olm.crypto_store.update_outbound_group_session(session)
+            except Exception:
+                logger.warning("Matrix: failed to retry the current authorized room key")
+                return 0, unresolved + delivered
+
+        if unresolved:
+            logger.warning(
+                "Matrix: current room key still has %d authorized delivery target(s) pending",
+                unresolved,
+            )
+        elif delivered:
+            logger.info(
+                "Matrix: retried current room key to %d authorized device(s)",
+                delivered,
+            )
+        return delivered, unresolved
+
     def _is_duplicate_event(self, event_id) -> bool:
         """Return True if this event was already processed. Tracks the ID otherwise."""
         if not event_id:
@@ -2485,6 +2604,9 @@ class MatrixAdapter(BasePlatformAdapter):
                         return SendResult(success=False, error=str(retry_exc))
                 logger.error("Matrix: failed to send to %s: %s", chat_id, exc)
                 return SendResult(success=False, error=str(exc))
+
+        if self._encryption and getattr(self._client, "crypto", None):
+            await self._retry_recovery_user_room_keys(chat_id)
 
         return SendResult(success=True, message_id=last_event_id)
 

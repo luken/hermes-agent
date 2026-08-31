@@ -612,6 +612,65 @@ class TestMatrixE2EEKeyRecovery:
         assert await self._bootstrap() == 0
         self.olm.send_encrypted_to_device.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_current_outbound_key_retries_a_device_missed_by_initial_share(self):
+        self.client.crypto = self.olm
+        self.olm.state_store = self.crypto_state
+        self.olm._fetch_keys = AsyncMock(
+            return_value={"@alice:example.org": {"ALICEDEVICE": self.device}}
+        )
+        self.olm._find_olm_sessions = AsyncMock(
+            side_effect=[object(), (MagicMock(), self.device)]
+        )
+        self.olm._create_outbound_sessions = AsyncMock()
+        self.olm._encrypt_and_share_group_session = AsyncMock()
+        self.olm.crypto_store.update_outbound_group_session = AsyncMock()
+        outbound = MagicMock()
+        outbound.shared = True
+        outbound.expired = False
+        outbound.users_shared_with = set()
+        outbound.users_ignored = set()
+        self.olm.crypto_store.get_outbound_group_session = AsyncMock(
+            return_value=outbound
+        )
+
+        assert await self.adapter._retry_recovery_user_room_keys(
+            "!room:example.org"
+        ) == (1, 0)
+
+        self.olm._create_outbound_sessions.assert_awaited_once()
+        self.olm._encrypt_and_share_group_session.assert_awaited_once()
+        self.olm.crypto_store.update_outbound_group_session.assert_awaited_once_with(
+            outbound
+        )
+
+    @pytest.mark.asyncio
+    async def test_current_outbound_key_remains_retryable_when_olm_is_unavailable(self):
+        self.client.crypto = self.olm
+        self.olm.state_store = self.crypto_state
+        self.olm._fetch_keys = AsyncMock(
+            return_value={"@alice:example.org": {"ALICEDEVICE": self.device}}
+        )
+        self.olm._find_olm_sessions = AsyncMock(side_effect=[object(), object()])
+        self.olm._create_outbound_sessions = AsyncMock(
+            side_effect=RuntimeError("no one-time key")
+        )
+        self.olm._encrypt_and_share_group_session = AsyncMock()
+        outbound = MagicMock()
+        outbound.shared = True
+        outbound.expired = False
+        outbound.users_shared_with = set()
+        outbound.users_ignored = set()
+        self.olm.crypto_store.get_outbound_group_session = AsyncMock(
+            return_value=outbound
+        )
+
+        assert await self.adapter._retry_recovery_user_room_keys(
+            "!room:example.org"
+        ) == (0, 1)
+
+        self.olm._encrypt_and_share_group_session.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # Typing indicator
@@ -1886,6 +1945,24 @@ class TestMatrixDiagnostics:
 
 
 class TestMatrixEncryptedSendFallback:
+    @pytest.mark.asyncio
+    async def test_successful_send_retries_authorized_current_room_key(self):
+        adapter = _make_adapter()
+        adapter._encryption = True
+        adapter._retry_recovery_user_room_keys = AsyncMock(return_value=(1, 0))
+
+        fake_client = MagicMock()
+        fake_client.send_message_event = AsyncMock(return_value="$event123")
+        fake_client.crypto = MagicMock()
+        adapter._client = fake_client
+
+        result = await adapter.send("!room:example.org", "hello")
+
+        assert result.success is True
+        adapter._retry_recovery_user_room_keys.assert_awaited_once_with(
+            "!room:example.org"
+        )
+
     @pytest.mark.asyncio
     async def test_send_retries_after_e2ee_error(self):
         """send() should retry with crypto.share_keys() on E2EE errors."""
