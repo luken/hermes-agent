@@ -78,6 +78,66 @@ def test_profile_skill_validation_honors_configured_skill_roots(
     kb.validate_profile_skills("builder", ["shared-skill"])
 
 
+def test_profile_skill_validation_allows_environment_hidden_forced_skill(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill = (
+        kanban_home
+        / "profiles"
+        / "reviewer"
+        / "skills"
+        / "devops"
+        / "review-skill"
+    )
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: review-skill\n"
+        "description: test review skill\n"
+        "environments: [kanban]\n"
+        "---\n"
+        "Use it.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    kb.validate_profile_skills("reviewer", ["review-skill"])
+
+
+def test_profile_skill_validation_keeps_runtime_loadability_gates(
+    kanban_home: Path,
+) -> None:
+    _profile_skill(kanban_home, "reviewer", "disabled-skill")
+    unsupported = (
+        kanban_home / "profiles" / "reviewer" / "skills" / "unsupported-skill"
+    )
+    unsupported.mkdir(parents=True)
+    (unsupported / "SKILL.md").write_text(
+        "---\n"
+        "name: unsupported-skill\n"
+        "description: test unsupported skill\n"
+        "platforms: [unsupported-test-platform]\n"
+        "---\n"
+        "Use it.\n",
+        encoding="utf-8",
+    )
+    (kanban_home / "profiles" / "reviewer" / "config.yaml").write_text(
+        "skills:\n  disabled:\n    - disabled-skill\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        kb.validate_profile_skills(
+            "reviewer", ["disabled-skill", "unsupported-skill"]
+        )
+
+    error = str(exc_info.value)
+    assert "disabled-skill" in error
+    assert "unsupported-skill" in error
+
+
 def test_operator_can_repair_legacy_skills_only_while_task_is_unclaimed(
     kanban_home: Path,
 ) -> None:

@@ -3160,8 +3160,9 @@ def available_profile_skill_names(profile: str) -> set[str]:
 
     Kanban dispatch changes ``HERMES_HOME`` before starting the worker, so the
     dispatcher's own skill catalog is not authoritative.  Resolve and scan the
-    assignee profile using the same platform/environment/disabled gates as the
-    runtime skill index.  Project-local skills are intentionally excluded:
+    assignee profile using the same platform/disabled gates as an explicit
+    runtime skill load.  Environment relevance is an offer-time filter, so a
+    forced skill intentionally bypasses it.  Project-local skills are excluded:
     worktree creation happens after admission and a forced skill must remain
     available when the task is re-created in a fresh checkout.
     """
@@ -3170,7 +3171,6 @@ def available_profile_skill_names(profile: str) -> set[str]:
         get_disabled_skill_names,
         iter_skill_index_files,
         parse_frontmatter,
-        skill_matches_environment,
         skill_matches_platform,
     )
     from hermes_cli.profiles import resolve_profile_env
@@ -3197,7 +3197,6 @@ def available_profile_skill_names(profile: str) -> set[str]:
                         name
                         and name not in disabled
                         and skill_matches_platform(frontmatter)
-                        and skill_matches_environment(frontmatter)
                     ):
                         names.add(name)
                 except (OSError, UnicodeError, ValueError, TypeError):
