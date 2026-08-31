@@ -29,6 +29,7 @@ COPY --chown=root:root --chmod=0644 agent/conversation_loop.py /opt/hermes/agent
 COPY --chown=root:root --chmod=0644 agent/error_classifier.py /opt/hermes/agent/error_classifier.py
 COPY --chown=root:root --chmod=0644 agent/kanban_stop.py /opt/hermes/agent/kanban_stop.py
 COPY --chown=root:root --chmod=0644 agent/prompt_builder.py /opt/hermes/agent/prompt_builder.py
+COPY --chown=root:root --chmod=0644 agent/secret_scope.py /opt/hermes/agent/secret_scope.py
 COPY --chown=root:root --chmod=0644 agent/tool_executor.py /opt/hermes/agent/tool_executor.py
 COPY --chown=root:root --chmod=0644 agent/verification_evidence.py /opt/hermes/agent/verification_evidence.py
 COPY --chown=root:root --chmod=0644 agent/transports/hermes_tools_mcp_server.py /opt/hermes/agent/transports/hermes_tools_mcp_server.py
