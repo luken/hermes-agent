@@ -86,6 +86,8 @@ matrix:
   require_mention: true           # Require @mention in rooms (default: true)
   allowed_users:                  # Matrix users allowed to trigger agent turns
     - "@alice:matrix.org"
+  e2ee_key_recovery_users:        # Listed joined users may recover retained room keys
+    - "@alice:matrix.org"
   allowed_rooms:                  # Matrix rooms allowed to trigger agent turns
     - "!abc123:matrix.org"
   free_response_rooms:            # Rooms exempt from mention requirement
@@ -122,6 +124,15 @@ MATRIX_ALLOW_ROOM_MENTIONS=false
 
 :::tip Room-wide mentions
 Hermes sends structured Matrix user mentions for explicit Matrix IDs such as `@alice:example.org`. Room-wide `@room` notifications are disabled by default; set `MATRIX_ALLOW_ROOM_MENTIONS=true` only in rooms where the bot is allowed to notify everyone.
+:::
+
+:::note E2EE key recovery
+`e2ee_key_recovery_users` is intentionally separate from `allowed_users` and
+defaults to an empty list. When configured, Hermes may fulfill a retained
+Megolm room-key request only for a listed user when both that user and Hermes
+are currently joined to the exact encrypted room. This lets a newly restored
+or temporarily offline Matrix client recover messages that Hermes already
+sent without disabling encryption or granting access to another room.
 :::
 
 :::note

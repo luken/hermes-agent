@@ -71,7 +71,7 @@ from dataclasses import dataclass, field
 from html import escape as _html_escape
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, NoReturn, Optional, Set
 
 from agent.secret_scope import UnscopedSecretError, get_secret
 
@@ -130,6 +130,7 @@ except ImportError:
     RoomCreatePreset = _RoomCreatePresetStub  # type: ignore[misc,assignment]
 
     class _TrustStateStub:  # type: ignore[no-redef]
+        BLACKLISTED = -1
         UNVERIFIED = 0
         VERIFIED = 1
 
@@ -1401,6 +1402,19 @@ class MatrixAdapter(BasePlatformAdapter):
         self._allowed_user_ids: Set[str] = {
             u.strip() for u in allowed_users_raw.split(",") if u.strip()
         }
+        key_recovery_users_raw = config.extra.get("e2ee_key_recovery_users", [])
+        if isinstance(key_recovery_users_raw, list):
+            self._e2ee_key_recovery_user_ids: Set[str] = {
+                str(user_id).strip()
+                for user_id in key_recovery_users_raw
+                if str(user_id).strip()
+            }
+        else:
+            self._e2ee_key_recovery_user_ids = {
+                user_id.strip()
+                for user_id in str(key_recovery_users_raw).split(",")
+                if user_id.strip()
+            }
         self._allowed_room_ids: Set[str] = set(self._allowed_rooms)
         ignore_patterns_raw = os.getenv("MATRIX_IGNORE_USER_PATTERNS", "")
         self._ignored_user_patterns: list[re.Pattern[str]] = []
@@ -1413,6 +1427,61 @@ class MatrixAdapter(BasePlatformAdapter):
                     pattern,
                     exc,
                 )
+
+    async def _allow_room_key_share(
+        self,
+        olm: Any,
+        crypto_state: _CryptoStateStore,
+        device: Any,
+        request: Any,
+    ) -> bool:
+        """Authorize a retained Megolm session request without weakening E2EE.
+
+        mautrix only shares keys with another device belonging to the bot user
+        by default. Cross-user recovery is opt-in and remains bound to an exact
+        configured user, an encrypted room that Hermes is currently joined to,
+        and authoritative current joined-member state from the homeserver.
+        """
+        from mautrix.crypto import RejectKeyShare
+
+        client = getattr(olm, "client", None) or self._client
+        requester = str(getattr(device, "user_id", "") or "")
+        room_id = str(getattr(request, "room_id", "") or "")
+        client_user = str(getattr(client, "mxid", "") or self._user_id)
+
+        if requester == client_user:
+            return await olm.default_allow_key_share(device, request)
+
+        def reject(message: str) -> NoReturn:
+            raise RejectKeyShare(message, code=None)
+
+        if requester not in self._e2ee_key_recovery_user_ids:
+            reject("Ignoring key request from a user without recovery access")
+        if not room_id or room_id not in self._joined_rooms:
+            reject("Ignoring key request for a room Hermes is not joined to")
+        if not await crypto_state.is_encrypted(RoomID(room_id)):
+            reject("Ignoring key request for a room that is not encrypted")
+        if client is None or not hasattr(client, "get_joined_members"):
+            reject("Ignoring key request because joined membership is unavailable")
+
+        try:
+            joined_members = await client.get_joined_members(RoomID(room_id))
+        except Exception:
+            logger.warning(
+                "Matrix: failed closed while checking membership for a room-key request"
+            )
+            reject("Ignoring key request because joined membership could not be verified")
+
+        joined_user_ids = {str(user_id) for user_id in joined_members}
+        if requester not in joined_user_ids or client_user not in joined_user_ids:
+            reject("Ignoring key request from a user who is not joined to the room")
+
+        blacklisted = getattr(TrustState, "BLACKLISTED", object())
+        if getattr(device, "trust", None) == blacklisted:
+            reject("Ignoring key request from a blacklisted device")
+        if await olm.resolve_trust(device) < olm.share_keys_min_trust:
+            reject("Ignoring key request from a device below the key-sharing trust threshold")
+        return True
 
     def _is_duplicate_event(self, event_id) -> bool:
         """Return True if this event was already processed. Tracks the ID otherwise."""
@@ -1994,6 +2063,13 @@ class MatrixAdapter(BasePlatformAdapter):
                     olm.share_keys_min_trust = TrustState.UNVERIFIED
                     olm.send_keys_min_trust = TrustState.UNVERIFIED
 
+                    async def allow_room_key_share(device: Any, request: Any) -> bool:
+                        return await self._allow_room_key_share(
+                            olm, crypto_state, device, request
+                        )
+
+                    olm.allow_key_share = allow_room_key_share
+
                     await olm.load()
 
                     if not await self._verify_device_keys_on_server(client, olm):
@@ -2322,6 +2398,9 @@ class MatrixAdapter(BasePlatformAdapter):
                 "crypto_store_path": str(_CRYPTO_DB_PATH),
                 "recovery_key_configured": bool(
                     _scoped_recovery_key().strip()
+                ),
+                "key_recovery_user_count": len(
+                    self._e2ee_key_recovery_user_ids
                 ),
             },
             "policy": {
