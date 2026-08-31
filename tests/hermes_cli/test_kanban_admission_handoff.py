@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -103,6 +104,17 @@ def test_profile_skill_validation_allows_environment_hidden_forced_skill(
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
 
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.skills_tool import skill_view
+
+    token = set_hermes_home_override(resolve_profile_env("reviewer"))
+    try:
+        loaded = json.loads(skill_view("review-skill", preprocess=False))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert loaded["success"] is True
     kb.validate_profile_skills("reviewer", ["review-skill"])
 
 
