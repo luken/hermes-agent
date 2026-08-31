@@ -133,6 +133,15 @@ Megolm room-key request only for a listed user when both that user and Hermes
 are currently joined to the exact encrypted room. This lets a newly restored
 or temporarily offline Matrix client recover messages that Hermes already
 sent without disabling encryption or granting access to another room.
+
+Some clients retry only their own key backup and do not request a missing key
+from the original sender. For a controlled incident, an operator may
+temporarily add an exact `e2ee_key_recovery_sessions` target containing
+`user_id`, `device_id`, `room_id`, and `session_id`. Hermes forwards that one
+retained session from its live crypto process only after the same allowlist,
+current-membership, encrypted-room, and device-trust checks pass. Remove the
+target immediately after the client has decrypted the affected events; this
+setting is not intended for steady-state configuration.
 :::
 
 :::note

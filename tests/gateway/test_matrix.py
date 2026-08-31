@@ -46,6 +46,7 @@ def _make_fake_mautrix():
         REACTION = "m.reaction"
         ROOM_ENCRYPTED = "m.room.encrypted"
         ROOM_NAME = "m.room.name"
+        FORWARDED_ROOM_KEY = "m.forwarded_room_key"
 
     class UserID(str):
         pass
@@ -61,6 +62,26 @@ def _make_fake_mautrix():
 
     class SyncToken(str):
         pass
+
+    class DeviceID(str):
+        pass
+
+    class IdentityKey(str):
+        pass
+
+    class SessionID(str):
+        pass
+
+    class EncryptionAlgorithm:
+        MEGOLM_V1 = "m.megolm.v1.aes-sha2"
+
+    class RequestedKeyInfo:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class ForwardedRoomKeyEventContent:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
 
     class RoomCreatePreset:
         PRIVATE = "private_chat"
@@ -87,6 +108,12 @@ def _make_fake_mautrix():
     mautrix_types.EventID = EventID
     mautrix_types.ContentURI = ContentURI
     mautrix_types.SyncToken = SyncToken
+    mautrix_types.DeviceID = DeviceID
+    mautrix_types.IdentityKey = IdentityKey
+    mautrix_types.SessionID = SessionID
+    mautrix_types.EncryptionAlgorithm = EncryptionAlgorithm
+    mautrix_types.RequestedKeyInfo = RequestedKeyInfo
+    mautrix_types.ForwardedRoomKeyEventContent = ForwardedRoomKeyEventContent
     mautrix_types.RoomCreatePreset = RoomCreatePreset
     mautrix_types.PresenceState = PresenceState
     mautrix_types.TrustState = TrustState
@@ -335,6 +362,33 @@ class TestMatrixConfigLoading:
 
         assert adapter._e2ee_key_recovery_user_ids == expected
 
+    def test_matrix_e2ee_key_recovery_sessions_require_exact_targets(self):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        exact_target = {
+            "user_id": "@alice:example.org",
+            "device_id": "ALICEDEVICE",
+            "room_id": "!room:example.org",
+            "session_id": "retained-session",
+        }
+        adapter = MatrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="syt_test_token",
+                extra={
+                    "homeserver": "https://matrix.example.org",
+                    "user_id": "@bot:example.org",
+                    "e2ee_key_recovery_sessions": [
+                        exact_target,
+                        {"user_id": "@missing-fields:example.org"},
+                        "not-a-target",
+                    ],
+                },
+            )
+        )
+
+        assert adapter._e2ee_key_recovery_sessions == [exact_target]
+
 
 # ---------------------------------------------------------------------------
 # Adapter helpers
@@ -367,6 +421,14 @@ class TestMatrixE2EEKeyRecovery:
                     "homeserver": "https://matrix.example.org",
                     "user_id": "@bot:example.org",
                     "e2ee_key_recovery_users": ["@alice:example.org"],
+                    "e2ee_key_recovery_sessions": [
+                        {
+                            "user_id": "@alice:example.org",
+                            "device_id": "ALICEDEVICE",
+                            "room_id": "!room:example.org",
+                            "session_id": "retained-session",
+                        }
+                    ],
                 },
             )
         )
@@ -388,10 +450,24 @@ class TestMatrixE2EEKeyRecovery:
         self.olm.share_keys_min_trust = 0
         self.olm.resolve_trust = AsyncMock(return_value=0)
         self.olm.default_allow_key_share = AsyncMock(return_value=True)
+        self.olm.get_or_fetch_device = AsyncMock()
+        self.olm.send_encrypted_to_device = AsyncMock()
+        self.olm.crypto_store = MagicMock()
+        self.olm.crypto_store.get_group_session = AsyncMock()
         self.device = MagicMock()
         self.device.user_id = "@alice:example.org"
         self.device.device_id = "ALICEDEVICE"
         self.device.trust = 0
+        self.olm.get_or_fetch_device.return_value = self.device
+        self.session = MagicMock()
+        self.session.sender_key = "sender-key"
+        self.session.room_id = "!room:example.org"
+        self.session.id = "retained-session"
+        self.session.first_known_index = 3
+        self.session.forwarding_chain = []
+        self.session.signing_key = "signing-key"
+        self.session.export_session.return_value = "exported-session-key"
+        self.olm.crypto_store.get_group_session.return_value = self.session
         self.request = MagicMock()
         self.request.room_id = "!room:example.org"
         self.fake_mautrix = _make_fake_mautrix()
@@ -404,6 +480,13 @@ class TestMatrixE2EEKeyRecovery:
                 self.crypto_state,
                 self.device,
                 self.request,
+            )
+
+    async def _bootstrap(self):
+        with patch.dict("sys.modules", self.fake_mautrix):
+            return await self.adapter._bootstrap_configured_room_keys(
+                self.olm,
+                self.crypto_state,
             )
 
     @pytest.mark.asyncio
@@ -465,6 +548,45 @@ class TestMatrixE2EEKeyRecovery:
             self.device, self.request
         )
         self.crypto_state.is_encrypted.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exact_bootstrap_target_forwards_retained_session(self):
+        assert await self._bootstrap() == 1
+
+        self.olm.get_or_fetch_device.assert_awaited_once_with(
+            "@alice:example.org", "ALICEDEVICE"
+        )
+        self.olm.crypto_store.get_group_session.assert_awaited_once_with(
+            "!room:example.org", "retained-session"
+        )
+        self.session.export_session.assert_called_once_with(3)
+        device, event_type, content = self.olm.send_encrypted_to_device.await_args.args
+        assert device is self.device
+        assert event_type == "m.forwarded_room_key"
+        assert content.room_id == "!room:example.org"
+        assert content.session_id == "retained-session"
+        assert content.session_key == "exported-session-key"
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_target_without_recovery_access_fails_before_device_lookup(self):
+        self.adapter._e2ee_key_recovery_sessions[0]["user_id"] = (
+            "@mallory:example.org"
+        )
+
+        assert await self._bootstrap() == 0
+        self.olm.get_or_fetch_device.assert_not_awaited()
+        self.olm.send_encrypted_to_device.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_missing_session_or_failed_policy_sends_nothing(self):
+        self.olm.crypto_store.get_group_session.return_value = None
+        assert await self._bootstrap() == 0
+        self.olm.send_encrypted_to_device.assert_not_awaited()
+
+        self.olm.crypto_store.get_group_session.return_value = self.session
+        self.adapter._joined_rooms.clear()
+        assert await self._bootstrap() == 0
+        self.olm.send_encrypted_to_device.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
