@@ -73,6 +73,7 @@ def _make_fake_mautrix():
         UNAVAILABLE = "unavailable"
 
     class TrustState:
+        BLACKLISTED = -1
         UNVERIFIED = 0
         VERIFIED = 1
 
@@ -156,6 +157,12 @@ def _make_fake_mautrix():
     # --- mautrix.crypto ---
     mautrix_crypto = types.ModuleType("mautrix.crypto")
 
+    class RejectKeyShare(Exception):
+        def __init__(self, message="", code=None, reason=None):
+            super().__init__(message)
+            self.code = code
+            self.reason = reason
+
     class OlmMachine:
         def __init__(self, client=None, crypto_store=None, state_store=None):
             self.share_keys_min_trust = None
@@ -171,6 +178,7 @@ def _make_fake_mautrix():
             return event
 
     mautrix_crypto.OlmMachine = OlmMachine
+    mautrix_crypto.RejectKeyShare = RejectKeyShare
 
     # --- mautrix.crypto.store ---
     mautrix_crypto_store = types.ModuleType("mautrix.crypto.store")
@@ -300,6 +308,33 @@ class TestMatrixConfigLoading:
         assert home.chat_id == "!room123:example.org"
         assert home.name == "Bot Room"
 
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            (["@alice:example.org", " @bob:example.org "], {
+                "@alice:example.org", "@bob:example.org"
+            }),
+            ("@alice:example.org, @bob:example.org", {
+                "@alice:example.org", "@bob:example.org"
+            }),
+            (None, set()),
+        ],
+    )
+    def test_matrix_e2ee_key_recovery_users_are_explicit(self, configured, expected):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        extra = {
+            "homeserver": "https://matrix.example.org",
+            "user_id": "@bot:example.org",
+        }
+        if configured is not None:
+            extra["e2ee_key_recovery_users"] = configured
+        adapter = MatrixAdapter(
+            PlatformConfig(enabled=True, token="syt_test_token", extra=extra)
+        )
+
+        assert adapter._e2ee_key_recovery_user_ids == expected
+
 
 # ---------------------------------------------------------------------------
 # Adapter helpers
@@ -318,6 +353,118 @@ def _make_adapter():
     )
     adapter = MatrixAdapter(config)
     return adapter
+
+
+class TestMatrixE2EEKeyRecovery:
+    def setup_method(self):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        self.adapter = MatrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="syt_test_token",
+                extra={
+                    "homeserver": "https://matrix.example.org",
+                    "user_id": "@bot:example.org",
+                    "e2ee_key_recovery_users": ["@alice:example.org"],
+                },
+            )
+        )
+        self.adapter._joined_rooms = {"!room:example.org"}
+        self.client = MagicMock()
+        self.client.mxid = "@bot:example.org"
+        self.client.device_id = "BOTDEVICE"
+        self.client.get_joined_members = AsyncMock(
+            return_value={
+                "@bot:example.org": MagicMock(),
+                "@alice:example.org": MagicMock(),
+            }
+        )
+        self.adapter._client = self.client
+        self.crypto_state = MagicMock()
+        self.crypto_state.is_encrypted = AsyncMock(return_value=True)
+        self.olm = MagicMock()
+        self.olm.client = self.client
+        self.olm.share_keys_min_trust = 0
+        self.olm.resolve_trust = AsyncMock(return_value=0)
+        self.olm.default_allow_key_share = AsyncMock(return_value=True)
+        self.device = MagicMock()
+        self.device.user_id = "@alice:example.org"
+        self.device.device_id = "ALICEDEVICE"
+        self.device.trust = 0
+        self.request = MagicMock()
+        self.request.room_id = "!room:example.org"
+        self.fake_mautrix = _make_fake_mautrix()
+        self.reject_key_share = self.fake_mautrix["mautrix.crypto"].RejectKeyShare
+
+    async def _authorize(self):
+        with patch.dict("sys.modules", self.fake_mautrix):
+            return await self.adapter._allow_room_key_share(
+                self.olm,
+                self.crypto_state,
+                self.device,
+                self.request,
+            )
+
+    @pytest.mark.asyncio
+    async def test_authorized_joined_user_may_recover_encrypted_room_key(self):
+        assert await self._authorize() is True
+        self.crypto_state.is_encrypted.assert_awaited_once_with("!room:example.org")
+        self.client.get_joined_members.assert_awaited_once_with("!room:example.org")
+        self.olm.resolve_trust.assert_awaited_once_with(self.device)
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_user_is_rejected_before_room_lookup(self):
+        self.device.user_id = "@mallory:example.org"
+
+        with pytest.raises(self.reject_key_share, match="without recovery access"):
+            await self._authorize()
+
+        self.crypto_state.is_encrypted.assert_not_awaited()
+        self.client.get_joined_members.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", ["not_joined", "unencrypted", "not_member"])
+    async def test_room_boundary_failures_are_rejected(self, failure):
+        if failure == "not_joined":
+            self.adapter._joined_rooms.clear()
+        elif failure == "unencrypted":
+            self.crypto_state.is_encrypted.return_value = False
+        else:
+            self.client.get_joined_members.return_value = {
+                "@bot:example.org": MagicMock()
+            }
+
+        with pytest.raises(self.reject_key_share):
+            await self._authorize()
+
+    @pytest.mark.asyncio
+    async def test_membership_lookup_failure_is_closed(self):
+        self.client.get_joined_members.side_effect = RuntimeError("homeserver unavailable")
+
+        with pytest.raises(self.reject_key_share, match="could not be verified"):
+            await self._authorize()
+
+    @pytest.mark.asyncio
+    async def test_blacklisted_or_below_threshold_device_is_rejected(self):
+        self.device.trust = -1
+        with pytest.raises(self.reject_key_share, match="blacklisted"):
+            await self._authorize()
+
+        self.device.trust = 0
+        self.olm.share_keys_min_trust = 1
+        with pytest.raises(self.reject_key_share, match="trust threshold"):
+            await self._authorize()
+
+    @pytest.mark.asyncio
+    async def test_same_user_requests_keep_mautrix_default_policy(self):
+        self.device.user_id = "@bot:example.org"
+
+        assert await self._authorize() is True
+        self.olm.default_allow_key_share.assert_awaited_once_with(
+            self.device, self.request
+        )
+        self.crypto_state.is_encrypted.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -979,6 +1126,7 @@ class TestMatrixAccessTokenAuth:
 
         mock_client.whoami.assert_awaited_once()
         assert adapter._user_id == "@bot:example.org"
+        assert asyncio.iscoroutinefunction(mock_olm.allow_key_share)
 
         await adapter.disconnect()
 
