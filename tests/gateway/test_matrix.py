@@ -389,6 +389,30 @@ class TestMatrixConfigLoading:
 
         assert adapter._e2ee_key_recovery_sessions == [exact_target]
 
+    def test_yaml_bridge_retains_structured_e2ee_recovery_policy(self):
+        from plugins.platforms.matrix.adapter import _apply_yaml_config
+
+        recovery_users = ["@alice:example.org"]
+        recovery_sessions = [
+            {
+                "user_id": "@alice:example.org",
+                "device_id": "ALICEDEVICE",
+                "room_id": "!room:example.org",
+                "session_id": "retained-session",
+            }
+        ]
+
+        assert _apply_yaml_config(
+            {},
+            {
+                "e2ee_key_recovery_users": recovery_users,
+                "e2ee_key_recovery_sessions": recovery_sessions,
+            },
+        ) == {
+            "e2ee_key_recovery_users": recovery_users,
+            "e2ee_key_recovery_sessions": recovery_sessions,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Adapter helpers
