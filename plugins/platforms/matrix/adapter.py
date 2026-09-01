@@ -3862,6 +3862,11 @@ class MatrixAdapter(BasePlatformAdapter):
             mentions_block.get("user_ids") if isinstance(mentions_block, dict) else None
         )
         is_mentioned = self._is_bot_mentioned(body, formatted_body, mention_user_ids)
+        is_explicitly_mentioned = self._is_bot_explicitly_mentioned(
+            body,
+            formatted_body,
+            mention_user_ids,
+        )
 
         identity_policy_enabled = bool(self._supervisor_user_id)
         joined_member_ids = getattr(identity, "joined_member_ids", None)
@@ -3881,7 +3886,11 @@ class MatrixAdapter(BasePlatformAdapter):
         # participation: when both Hermes identities share a room, an explicit
         # production-Hermes mention is required on every ordinary turn.
         # Unresolved membership fails closed to the same behavior.
-        if identity_requires_mention and not is_mentioned and not is_command:
+        if (
+            identity_requires_mention
+            and not is_explicitly_mentioned
+            and not is_command
+        ):
             logger.debug(
                 "Matrix: ignoring message %s in %s — production Hermes and "
                 "Supervisor share the room, or membership is unresolved, "
@@ -5543,6 +5552,49 @@ class MatrixAdapter(BasePlatformAdapter):
             if f"matrix.to/#/{self._user_id}" in formatted_body:
                 return True
         return False
+
+    def _is_bot_explicitly_mentioned(
+        self,
+        body: str,
+        formatted_body: Optional[str] = None,
+        mention_user_ids: Optional[list] = None,
+    ) -> bool:
+        """Return True only for an explicit mention of this Matrix identity.
+
+        Shared multi-agent rooms use this stricter predicate so prose containing
+        the bot's display name or localpart cannot dispatch a turn.  The broader
+        legacy mention predicate remains available to non-shared rooms.
+        """
+        if (
+            isinstance(mention_user_ids, (list, tuple, set, frozenset))
+            and self._user_id
+            and self._user_id in mention_user_ids
+        ):
+            return True
+        if not self._user_id:
+            return False
+
+        body = body or ""
+        full_mxid = re.escape(self._user_id)
+        if re.search(
+            r"(?<![\w@/#])" + full_mxid + r"(?![\w./:-])",
+            body,
+        ):
+            return True
+
+        if ":" in self._user_id:
+            localpart = self._user_id.split(":", 1)[0].lstrip("@")
+            if localpart and re.search(
+                r"(?<![\w@])@" + re.escape(localpart) + r"(?![\w:.-])",
+                body,
+                re.IGNORECASE,
+            ):
+                return True
+
+        return bool(
+            formatted_body
+            and f"matrix.to/#/{self._user_id}" in formatted_body
+        )
 
     def _strip_mention(self, body: str) -> str:
         """Remove explicit bot mentions from message body.

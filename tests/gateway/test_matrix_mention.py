@@ -112,7 +112,41 @@ async def test_supervisor_membership_is_the_only_matrix_mention_gate(
 
 
 @pytest.mark.asyncio
-async def test_explicit_hermes_mention_is_admitted_in_supervisor_room(tmp_path):
+@pytest.mark.parametrize(
+    ("body", "source_content"),
+    [
+        (
+            "Hermes, please continue",
+            {
+                "body": "Hermes, please continue",
+                "m.mentions": {"user_ids": ["@hermes:example.org"]},
+            },
+        ),
+        (
+            "@hermes:example.org please continue",
+            {"body": "@hermes:example.org please continue"},
+        ),
+        (
+            "@hermes please continue",
+            {"body": "@hermes please continue"},
+        ),
+        (
+            "Hermes, please continue",
+            {
+                "body": "Hermes, please continue",
+                "formatted_body": (
+                    '<a href="https://matrix.to/#/@hermes:example.org">'
+                    "Hermes</a>, please continue"
+                ),
+            },
+        ),
+    ],
+)
+async def test_explicit_hermes_mention_is_admitted_in_supervisor_room(
+    tmp_path,
+    body,
+    source_content,
+):
     adapter = _make_adapter(tmp_path)
     adapter._supervisor_user_id = "@hermes-supervisor:example.org"
     adapter._allowed_rooms = {"!supervisor:example.org"}
@@ -138,15 +172,90 @@ async def test_explicit_hermes_mention_is_admitted_in_supervisor_room(tmp_path):
         "!supervisor:example.org",
         "@alice:example.org",
         "$mentioned",
-        "Hermes, please continue",
-        {
-            "body": "Hermes, please continue",
-            "m.mentions": {"user_ids": ["@hermes:example.org"]},
-        },
+        body,
+        source_content,
         {},
     )
 
     assert context is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "joined_member_ids",
+    [
+        frozenset(
+            {
+                "@hermes:example.org",
+                "@hermes-supervisor:example.org",
+                "@alice:example.org",
+            }
+        ),
+        None,
+    ],
+)
+async def test_bare_hermes_name_is_rejected_by_shared_room_gate(
+    tmp_path,
+    joined_member_ids,
+):
+    adapter = _make_adapter(tmp_path)
+    adapter._supervisor_user_id = "@hermes-supervisor:example.org"
+    adapter._allowed_rooms = {"!supervisor:example.org"}
+    adapter._resolve_room_identity = AsyncMock(
+        return_value=SimpleNamespace(
+            display_name="Hermes Supervisor",
+            room_topic="",
+            server_name="example.org",
+            chat_type="group",
+            joined_member_ids=joined_member_ids,
+        )
+    )
+
+    context = await adapter._resolve_message_context(
+        "!supervisor:example.org",
+        "@hermes-supervisor:example.org",
+        "$finding",
+        "Hermes Supervisor finding: stalled-task",
+        {"body": "Hermes Supervisor finding: stalled-task"},
+        {},
+    )
+
+    assert context is None
+
+
+@pytest.mark.asyncio
+async def test_bare_supervisor_finding_never_dispatches_message_handler(tmp_path):
+    adapter = _make_adapter(tmp_path)
+    adapter._supervisor_user_id = "@hermes-supervisor:example.org"
+    adapter._allowed_rooms = {"!supervisor:example.org"}
+    adapter._allowed_user_ids = {"@hermes-supervisor:example.org"}
+    adapter._is_allowed_matrix_room_event = AsyncMock(return_value=True)
+    adapter._is_dm_room = AsyncMock(return_value=False)
+    adapter._resolve_room_identity = AsyncMock(
+        return_value=SimpleNamespace(
+            display_name="Hermes Supervisor",
+            room_topic="",
+            server_name="example.org",
+            chat_type="group",
+            joined_member_ids=frozenset(
+                {
+                    "@hermes:example.org",
+                    "@hermes-supervisor:example.org",
+                    "@alice:example.org",
+                }
+            ),
+        )
+    )
+
+    event = _make_event(
+        "Hermes Supervisor finding: stalled-task",
+        sender="@hermes-supervisor:example.org",
+        event_id="$finding",
+        room_id="!supervisor:example.org",
+    )
+    await adapter._on_room_message(event)
+
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -273,6 +382,42 @@ class TestIsBotMentioned:
         """m.mentions.user_ids alone is sufficient — no body text needed."""
         assert self.adapter._is_bot_mentioned(
             "please reply",  # no @hermes anywhere in body
+            mention_user_ids=["@hermes:example.org"],
+        )
+
+
+class TestIsBotExplicitlyMentioned:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "Hermes Supervisor finding: stalled-task",
+            "hermes can you help?",
+            "https://matrix.to/#/@hermes:example.org",
+            "email@hermes.example.org",
+            "@hermes:elsewhere.example.org",
+        ],
+    )
+    def test_bare_or_embedded_names_are_not_explicit(self, body):
+        assert not self.adapter._is_bot_explicitly_mentioned(body)
+
+    def test_literal_full_mxid_is_explicit(self):
+        assert self.adapter._is_bot_explicitly_mentioned(
+            "please ask @hermes:example.org, thanks"
+        )
+
+    def test_literal_localpart_token_is_explicit(self):
+        assert self.adapter._is_bot_explicitly_mentioned("please ask @Hermes now")
+
+    def test_matrix_pill_is_explicit(self):
+        html = '<a href="https://matrix.to/#/@hermes:example.org">Hermes</a>'
+        assert self.adapter._is_bot_explicitly_mentioned("please reply", html)
+
+    def test_m_mentions_is_explicit(self):
+        assert self.adapter._is_bot_explicitly_mentioned(
+            "please reply",
             mention_user_ids=["@hermes:example.org"],
         )
 
